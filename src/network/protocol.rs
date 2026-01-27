@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,51 @@ pub enum ServerMessage {
     GameState { players: Vec<PlayerState> },
     /// A player has disconnected.
     PlayerLeft { id: PlayerId },
+    /// Screen frame fragment for streaming.
+    ScreenFrame(ScreenFragment),
+}
+
+/// A fragment of a screen frame for network transmission.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ScreenFragment {
+    /// Frame sequence number.
+    pub frame_id: u32,
+    /// Fragment index within this frame.
+    pub fragment_idx: u16,
+    /// Total number of fragments for this frame.
+    pub total_fragments: u16,
+    /// Frame width (sent in first fragment).
+    pub width: u32,
+    /// Frame height (sent in first fragment).
+    pub height: u32,
+    /// JPEG data chunk (base64 encoded for efficient JSON serialization).
+    pub data: String,
+}
+
+impl ScreenFragment {
+    /// Create a new fragment with base64-encoded data.
+    pub fn new(
+        frame_id: u32,
+        fragment_idx: u16,
+        total_fragments: u16,
+        width: u32,
+        height: u32,
+        raw_data: &[u8],
+    ) -> Self {
+        Self {
+            frame_id,
+            fragment_idx,
+            total_fragments,
+            width,
+            height,
+            data: BASE64.encode(raw_data),
+        }
+    }
+
+    /// Decode the base64 data back to bytes.
+    pub fn decode_data(&self) -> Option<Vec<u8>> {
+        BASE64.decode(&self.data).ok()
+    }
 }
 
 /// State of a single player, broadcast by the server.

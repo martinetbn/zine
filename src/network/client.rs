@@ -8,6 +8,7 @@ use super::protocol::{
 };
 use crate::game_state::AppState;
 use crate::player::Player;
+use crate::screen::streaming::{decode_jpeg_to_rgba, FrameAssembler, JitterBuffer};
 
 /// Resource indicating this instance is a client.
 #[derive(Resource)]
@@ -28,7 +29,7 @@ pub fn client_plugin(app: &mut App) {
         )
         .add_systems(
             Update,
-            (client_receive, send_player_update)
+            (client_receive, send_player_update, process_jitter_buffer)
                 .run_if(in_state(AppState::InGame).and(resource_exists::<GameClient>)),
         );
 }
@@ -52,6 +53,23 @@ fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) 
         return;
     }
 
+    // Increase receive buffer for screen streaming fragments
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        unsafe {
+            let buf_size: i32 = 1024 * 1024; // 1MB receive buffer
+            let raw = socket.as_raw_socket();
+            winapi::um::winsock2::setsockopt(
+                raw as usize,
+                winapi::um::winsock2::SOL_SOCKET as i32,
+                winapi::um::winsock2::SO_RCVBUF as i32,
+                &buf_size as *const i32 as *const i8,
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+
     if let Err(e) = socket.connect(selected.0.address) {
         error!("Failed to connect: {}", e);
         return;
@@ -69,6 +87,8 @@ fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) 
         Duration::from_millis(50),
         TimerMode::Repeating,
     )));
+    commands.insert_resource(FrameAssembler::default());
+    commands.insert_resource(JitterBuffer::default());
 
     info!("Connecting to server at {}", selected.0.address);
 }
@@ -79,6 +99,16 @@ fn cleanup_client(mut commands: Commands) {
     commands.remove_resource::<LocalPlayerId>();
     commands.remove_resource::<RemotePlayers>();
     commands.remove_resource::<ClientSyncTimer>();
+    commands.remove_resource::<FrameAssembler>();
+    commands.remove_resource::<JitterBuffer>();
+}
+
+/// Event to update the screen texture with received frame data.
+#[derive(Event)]
+pub struct ReceivedScreenFrame {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn client_receive(
@@ -86,10 +116,13 @@ fn client_receive(
     mut commands: Commands,
     mut remote_players: Option<ResMut<RemotePlayers>>,
     local_id: Option<Res<LocalPlayerId>>,
+    mut frame_assembler: Option<ResMut<FrameAssembler>>,
+    mut jitter_buffer: Option<ResMut<JitterBuffer>>,
 ) {
     let Some(client) = client else { return };
 
-    let mut buf = [0u8; 4096];
+    // Large buffer to handle screen frame fragments
+    let mut buf = [0u8; 32768];
 
     loop {
         match client.socket.recv(&mut buf) {
@@ -102,7 +135,6 @@ fn client_receive(
                         }
                         ServerMessage::GameState { players } => {
                             if let Some(ref mut remote) = remote_players {
-                                // Filter out local player
                                 let my_id = local_id.as_ref().map(|id| id.0);
                                 remote.players = players
                                     .into_iter()
@@ -114,6 +146,18 @@ fn client_receive(
                             info!("Player {} left", id);
                             if let Some(ref mut remote) = remote_players {
                                 remote.players.retain(|p| p.id != id);
+                            }
+                        }
+                        ServerMessage::ScreenFrame(fragment) => {
+                            if let Some(ref mut assembler) = frame_assembler {
+                                if let Some((jpeg_data, width, height, frame_id)) =
+                                    assembler.add_fragment(fragment)
+                                {
+                                    // Add complete frame to jitter buffer
+                                    if let Some(ref mut jitter) = jitter_buffer {
+                                        jitter.push_frame(jpeg_data, width, height, frame_id);
+                                    }
+                                }
                             }
                         }
                     }
@@ -159,6 +203,28 @@ fn send_player_update(
 
         if let Ok(data) = serde_json::to_vec(&msg) {
             let _ = client.socket.send(&data);
+        }
+    }
+}
+
+/// Process the jitter buffer and send frames to be displayed
+fn process_jitter_buffer(
+    mut jitter_buffer: Option<ResMut<JitterBuffer>>,
+    mut screen_frame_events: EventWriter<ReceivedScreenFrame>,
+) {
+    let Some(ref mut jitter) = jitter_buffer else {
+        return;
+    };
+
+    // Pop frame from jitter buffer when ready
+    if let Some((jpeg_data, _width, _height)) = jitter.pop_frame() {
+        // Decode JPEG and send event
+        if let Some((rgba, w, h)) = decode_jpeg_to_rgba(&jpeg_data) {
+            screen_frame_events.send(ReceivedScreenFrame {
+                rgba,
+                width: w,
+                height: h,
+            });
         }
     }
 }

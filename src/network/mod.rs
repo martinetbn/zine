@@ -5,6 +5,7 @@ pub mod server;
 
 use bevy::prelude::*;
 
+pub use client::ReceivedScreenFrame;
 pub use discovery::{DiscoveredSessions, LanSession, SelectedSession};
 pub use protocol::{LocalPlayerId, RemotePlayer, RemotePlayers};
 
@@ -21,6 +22,9 @@ impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         // Initialize discovery resources
         app.init_resource::<DiscoveredSessions>();
+
+        // Register screen frame event
+        app.add_event::<ReceivedScreenFrame>();
 
         // Server plugin
         server::server_plugin(app);

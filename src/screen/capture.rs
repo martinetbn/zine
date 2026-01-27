@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::world::Screen;
+use super::streaming::LatestCapturedFrame;
 use super::window_capture::capture_window;
 
 /// Type of capture source
@@ -262,6 +263,14 @@ fn apply_material_to_screen(world: &mut World) {
 }
 
 fn update_texture(world: &mut World, rgba: Vec<u8>, width: u32, height: u32, log: bool) {
+    // Update the latest captured frame for streaming
+    if let Some(mut latest_frame) = world.get_resource_mut::<LatestCapturedFrame>() {
+        latest_frame.rgba = rgba.clone();
+        latest_frame.width = width;
+        latest_frame.height = height;
+        latest_frame.frame_number += 1;
+    }
+
     let screen_texture = world.resource::<ScreenTexture>();
     let image_handle = screen_texture.handle.clone();
     let material_handle = screen_texture.material_handle.clone();

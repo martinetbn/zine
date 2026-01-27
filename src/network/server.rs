@@ -7,6 +7,9 @@ use super::discovery::GAME_PORT;
 use super::protocol::{ClientMessage, LocalPlayerId, PlayerId, PlayerState, ServerMessage};
 use crate::game_state::AppState;
 use crate::player::Player;
+use crate::screen::streaming::{
+    fragment_frame, BackgroundEncoder, BackgroundSender, LatestCapturedFrame, ScreenStreamState,
+};
 
 /// Resource indicating this instance is the server/host.
 #[derive(Resource)]
@@ -30,7 +33,12 @@ pub fn server_plugin(app: &mut App) {
         )
         .add_systems(
             Update,
-            (receive_client_messages, broadcast_game_state, update_host_player_state)
+            (
+                receive_client_messages,
+                broadcast_game_state,
+                update_host_player_state,
+                broadcast_screen_frames,
+            )
                 .run_if(in_state(AppState::InGame).and(resource_exists::<GameServer>)),
         );
 }
@@ -51,6 +59,32 @@ fn setup_server(mut commands: Commands) {
         return;
     }
 
+    // Increase send buffer for screen streaming
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        unsafe {
+            let buf_size: i32 = 1024 * 1024; // 1MB send buffer
+            let raw = socket.as_raw_socket();
+            winapi::um::winsock2::setsockopt(
+                raw as usize,
+                winapi::um::winsock2::SOL_SOCKET as i32,
+                winapi::um::winsock2::SO_SNDBUF as i32,
+                &buf_size as *const i32 as *const i8,
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+
+    // Clone socket for background sender before moving into GameServer
+    let stream_socket = match socket.try_clone() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("Failed to clone socket for streaming: {}", e);
+            None
+        }
+    };
+
     // Host is player 0
     let host_id: PlayerId = 0;
     let mut player_states = HashMap::new();
@@ -70,11 +104,19 @@ fn setup_server(mut commands: Commands) {
         next_player_id: 1,
     });
 
+    // Create background sender with cloned socket (sends from same port as server)
+    if let Some(stream_socket) = stream_socket {
+        commands.insert_resource(BackgroundSender::new(stream_socket));
+    }
+
     commands.insert_resource(LocalPlayerId(host_id));
     commands.insert_resource(ServerSyncTimer(Timer::new(
         Duration::from_millis(50), // 20 updates per second
         TimerMode::Repeating,
     )));
+    commands.insert_resource(ScreenStreamState::default());
+    commands.insert_resource(LastStreamedFrame::default());
+    commands.insert_resource(BackgroundEncoder::new());
 
     info!("Server started on port {}", GAME_PORT);
 }
@@ -83,6 +125,10 @@ fn cleanup_server(mut commands: Commands) {
     commands.remove_resource::<GameServer>();
     commands.remove_resource::<ServerSyncTimer>();
     commands.remove_resource::<LocalPlayerId>();
+    commands.remove_resource::<ScreenStreamState>();
+    commands.remove_resource::<LastStreamedFrame>();
+    commands.remove_resource::<BackgroundEncoder>();
+    commands.remove_resource::<BackgroundSender>();
 }
 
 fn server_ready_check(
@@ -179,5 +225,80 @@ fn broadcast_game_state(
         for &client_addr in server.clients.keys() {
             let _ = server.socket.send_to(&data, client_addr);
         }
+    }
+}
+
+/// Tracks the last frame number we submitted for encoding.
+#[derive(Resource, Default)]
+pub struct LastStreamedFrame(pub u64);
+
+/// Debug counter for logging
+#[derive(Resource, Default)]
+pub struct StreamDebugCounter(pub u32);
+
+fn broadcast_screen_frames(
+    server: Res<GameServer>,
+    latest_frame: Option<Res<LatestCapturedFrame>>,
+    mut stream_state: ResMut<ScreenStreamState>,
+    mut last_streamed: ResMut<LastStreamedFrame>,
+    encoder: Option<Res<BackgroundEncoder>>,
+    sender: Option<Res<BackgroundSender>>,
+    mut debug_counter: Local<StreamDebugCounter>,
+) {
+    let Some(encoder) = encoder else {
+        debug_counter.0 += 1;
+        if debug_counter.0 % 100 == 1 {
+            warn!("No BackgroundEncoder resource!");
+        }
+        return;
+    };
+
+    let Some(sender) = sender else {
+        return;
+    };
+
+    // Submit new frames for encoding (non-blocking)
+    if let Some(ref latest_frame) = latest_frame {
+        let has_data = !latest_frame.rgba.is_empty();
+        let is_new = latest_frame.frame_number != last_streamed.0;
+        let interval_ok = stream_state.last_stream_time.elapsed() >= stream_state.stream_interval;
+
+        if has_data && is_new && interval_ok {
+            // Submit frame to background encoder (non-blocking)
+            encoder.submit_frame(
+                latest_frame.rgba.clone(),
+                latest_frame.width,
+                latest_frame.height,
+            );
+            last_streamed.0 = latest_frame.frame_number;
+            stream_state.last_stream_time = std::time::Instant::now();
+        }
+    } else {
+        debug_counter.0 += 1;
+        if debug_counter.0 % 100 == 1 {
+            warn!("No LatestCapturedFrame resource!");
+        }
+    }
+
+    // Check for encoded frames and send them (non-blocking)
+    if server.clients.is_empty() {
+        return;
+    }
+
+    if let Some(encoded) = encoder.get_encoded() {
+        // Fragment the frame
+        let fragments = fragment_frame(
+            encoded.jpeg_data,
+            stream_state.frame_id,
+            encoded.width,
+            encoded.height,
+        );
+
+        // Submit to background sender (non-blocking)
+        let clients: Vec<SocketAddr> = server.clients.keys().cloned().collect();
+        sender.submit_fragments(fragments, clients);
+
+        // Update frame id
+        stream_state.frame_id = stream_state.frame_id.wrapping_add(1);
     }
 }

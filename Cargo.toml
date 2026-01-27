@@ -13,6 +13,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 scrap = "0.5"
 
+# Windows-specific dependencies for window capture
+[target.'cfg(windows)'.dependencies]
+win-screenshot = "4.0"
+winapi = { version = "0.3", features = ["winuser", "dwmapi"] }
+
 # Enable optimizations for better runtime performance in dev
 [profile.dev]
 opt-level = 2

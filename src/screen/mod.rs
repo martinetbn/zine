@@ -1,13 +1,14 @@
 pub mod capture;
 pub mod share_ui;
+pub mod window_capture;
 
 use bevy::prelude::*;
 
 use crate::game_state::AppState;
 use crate::world::ScreenControlEvent;
 use capture::{
-    cleanup_capture, handle_capture_events, process_capture_frames, start_screen_capture,
-    CaptureSource, ScreenTexture,
+    cleanup_capture, handle_capture_events, process_display_capture, process_window_capture,
+    start_capture, CaptureSource, ScreenTexture,
 };
 use share_ui::{
     cleanup_share_ui, handle_share_ui_interaction, setup_share_ui, update_source_list,
@@ -31,7 +32,10 @@ impl Plugin for ScreenPlugin {
                 ),
             )
             // Exclusive systems for capture (need direct World access)
-            .add_systems(Update, (start_screen_capture, process_capture_frames))
+            .add_systems(
+                Update,
+                (start_capture, process_display_capture, process_window_capture),
+            )
             .add_systems(OnExit(AppState::InGame), (cleanup_share_ui, cleanup_capture));
     }
 }

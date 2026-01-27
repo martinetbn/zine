@@ -2,7 +2,8 @@ use bevy::prelude::*;
 use bevy::window::CursorGrabMode;
 use scrap::Display;
 
-use super::capture::CaptureSource;
+use super::capture::{CaptureSource, CaptureSourceType};
+use super::window_capture::{enumerate_windows, WindowInfo};
 
 /// Resource tracking the share UI state.
 #[derive(Resource, Default)]
@@ -10,6 +11,7 @@ pub struct ShareUIState {
     pub selected_tab: ShareTab,
     pub selected_source: Option<usize>,
     pub available_screens: Vec<ScreenInfo>,
+    pub available_windows: Vec<WindowInfo>,
     pub needs_refresh: bool,
     pub last_rendered_tab: Option<ShareTab>,
 }
@@ -316,23 +318,40 @@ pub fn handle_share_ui_interaction(
     for interaction in share_query.iter() {
         if *interaction == Interaction::Pressed {
             if let Some(source_idx) = state.selected_source {
-                info!("Starting screen share for source {}", source_idx);
+                // Determine capture source based on selected tab
+                let capture_source = match state.selected_tab {
+                    ShareTab::Screens => {
+                        if let Some(screen) = state.available_screens.get(source_idx) {
+                            info!("Starting display capture for screen {}", screen.index);
+                            Some(CaptureSourceType::Display(screen.index))
+                        } else {
+                            None
+                        }
+                    }
+                    ShareTab::Windows => {
+                        if let Some(window) = state.available_windows.get(source_idx) {
+                            info!("Starting window capture for: {} (hwnd: {})", window.title, window.hwnd);
+                            Some(CaptureSourceType::Window(window.hwnd))
+                        } else {
+                            None
+                        }
+                    }
+                };
 
-                // Send capture event
-                capture_events.send(CaptureSource {
-                    screen_index: source_idx,
-                });
+                if let Some(source) = capture_source {
+                    capture_events.send(CaptureSource { source });
 
-                // Close UI
-                commands.entity(root.0).despawn_recursive();
-                commands.remove_resource::<ShareUIRoot>();
+                    // Close UI
+                    commands.entity(root.0).despawn_recursive();
+                    commands.remove_resource::<ShareUIRoot>();
 
-                // Re-grab cursor
-                if let Ok(mut window) = windows.get_single_mut() {
-                    window.cursor_options.grab_mode = CursorGrabMode::Locked;
-                    window.cursor_options.visible = false;
+                    // Re-grab cursor
+                    if let Ok(mut window) = windows.get_single_mut() {
+                        window.cursor_options.grab_mode = CursorGrabMode::Locked;
+                        window.cursor_options.visible = false;
+                    }
+                    return;
                 }
-                return;
             }
         }
     }
@@ -346,35 +365,55 @@ pub fn update_source_list(
     // Check if tab changed
     let tab_changed = state.last_rendered_tab != Some(state.selected_tab);
 
-    // Only update when screens list is empty, needs refresh, or tab changed
-    if !state.available_screens.is_empty() && !state.needs_refresh && !tab_changed {
+    // Determine if we need to refresh based on current tab
+    let needs_data_refresh = match state.selected_tab {
+        ShareTab::Screens => state.available_screens.is_empty() || state.needs_refresh,
+        ShareTab::Windows => state.available_windows.is_empty() || state.needs_refresh || tab_changed,
+    };
+
+    // Only update when data is empty, needs refresh, or tab changed
+    if !needs_data_refresh && !tab_changed {
         return;
     }
 
-    // Clear for refresh (only screens data, not every time)
-    if state.needs_refresh || state.available_screens.is_empty() {
-        state.available_screens.clear();
-    }
     state.needs_refresh = false;
     state.last_rendered_tab = Some(state.selected_tab);
 
-    // Enumerate displays
-    match Display::all() {
-        Ok(displays) => {
-            info!("Found {} displays", displays.len());
-            for (i, disp) in displays.iter().enumerate() {
-                let w = disp.width();
-                let h = disp.height();
-                let name = format!("Display {} ({}x{})", i + 1, w, h);
-                info!("  Display {}: {}x{}", i, w, h);
-                state.available_screens.push(ScreenInfo {
-                    name,
-                    index: i,
-                });
+    // Enumerate data based on selected tab
+    match state.selected_tab {
+        ShareTab::Screens => {
+            if state.available_screens.is_empty() {
+                // Enumerate displays
+                match Display::all() {
+                    Ok(displays) => {
+                        info!("Found {} displays", displays.len());
+                        for (i, disp) in displays.iter().enumerate() {
+                            let w = disp.width();
+                            let h = disp.height();
+                            let name = format!("Display {} ({}x{})", i + 1, w, h);
+                            info!("  Display {}: {}x{}", i, w, h);
+                            state.available_screens.push(ScreenInfo {
+                                name,
+                                index: i,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to enumerate displays: {}", e);
+                    }
+                }
             }
         }
-        Err(e) => {
-            error!("Failed to enumerate displays: {}", e);
+        ShareTab::Windows => {
+            // Always refresh windows list when switching to this tab
+            state.available_windows.clear();
+            info!("About to enumerate windows...");
+            let windows = enumerate_windows();
+            info!("enumerate_windows returned {} windows", windows.len());
+            for win in windows {
+                info!("  Window: {} (hwnd: {})", win.title, win.hwnd);
+                state.available_windows.push(win);
+            }
         }
     }
 
@@ -405,19 +444,31 @@ pub fn update_source_list(
                     ));
                 }
             } else {
-                // Windows tab - placeholder for now
-                parent.spawn((
-                    Text::new("Window capture coming soon..."),
-                    TextFont {
-                        font_size: 14.0,
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.5, 0.5, 0.5)),
-                    Node {
-                        margin: UiRect::all(Val::Px(10.0)),
-                        ..default()
-                    },
-                ));
+                // Windows tab
+                for (idx, window) in state.available_windows.iter().enumerate() {
+                    // Truncate long window titles
+                    let title = if window.title.len() > 50 {
+                        format!("{}...", &window.title[..47])
+                    } else {
+                        window.title.clone()
+                    };
+                    spawn_source_button(parent, &title, idx);
+                }
+
+                if state.available_windows.is_empty() {
+                    parent.spawn((
+                        Text::new("No capturable windows found"),
+                        TextFont {
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.5, 0.5, 0.5)),
+                        Node {
+                            margin: UiRect::all(Val::Px(10.0)),
+                            ..default()
+                        },
+                    ));
+                }
             }
         });
     }

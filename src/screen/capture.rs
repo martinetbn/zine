@@ -6,11 +6,19 @@ use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use crate::world::Screen;
+use super::window_capture::capture_window;
 
-/// Event to start capturing a screen.
+/// Type of capture source
+#[derive(Clone, Copy, Debug)]
+pub enum CaptureSourceType {
+    Display(usize),
+    Window(isize), // HWND on Windows
+}
+
+/// Event to start capturing a source.
 #[derive(Event)]
 pub struct CaptureSource {
-    pub screen_index: usize,
+    pub source: CaptureSourceType,
 }
 
 /// Resource holding the screen texture handle.
@@ -20,37 +28,74 @@ pub struct ScreenTexture {
     pub material_handle: Option<Handle<StandardMaterial>>,
 }
 
-/// NonSend resource for active screen capture (must run on main thread).
-pub struct ActiveCapture {
+/// NonSend resource for active display capture (must run on main thread).
+pub struct ActiveDisplayCapture {
     pub capturer: Capturer,
     pub width: u32,
     pub height: u32,
-    pub screen_index: usize,
     pub last_capture: Instant,
     pub capture_interval: Duration,
     pub frame_count: u32,
-    pub material_applied: bool,
     pub would_block_count: u32,
-    pub created_at: Instant,
+}
+
+/// Resource for active window capture
+#[derive(Resource)]
+pub struct ActiveWindowCapture {
+    pub hwnd: isize,
+    pub width: u32,
+    pub height: u32,
+    pub last_capture: Instant,
+    pub capture_interval: Duration,
+    pub frame_count: u32,
 }
 
 /// Resource to signal that capture should start.
 #[derive(Resource)]
 pub struct PendingCapture {
-    pub screen_index: usize,
+    pub source: CaptureSourceType,
 }
 
-/// Exclusive system to start screen capture.
-pub fn start_screen_capture(world: &mut World) {
-    // Check if there's a pending capture
+/// Handle capture events and create pending capture.
+pub fn handle_capture_events(
+    mut events: EventReader<CaptureSource>,
+    mut commands: Commands,
+) {
+    for event in events.read() {
+        info!("Capture event received: {:?}", event.source);
+        commands.insert_resource(PendingCapture {
+            source: event.source,
+        });
+    }
+}
+
+/// Exclusive system to start capture (display or window).
+pub fn start_capture(world: &mut World) {
     let pending = world.remove_resource::<PendingCapture>();
     let Some(pending) = pending else {
         return;
     };
 
-    info!("Starting capture for screen {}", pending.screen_index);
+    // Clean up any existing captures
+    world.remove_non_send_resource::<ActiveDisplayCapture>();
+    world.remove_resource::<ActiveWindowCapture>();
 
-    // Get the display
+    match pending.source {
+        CaptureSourceType::Display(screen_index) => {
+            start_display_capture(world, screen_index);
+        }
+        CaptureSourceType::Window(hwnd) => {
+            start_window_capture_impl(world, hwnd);
+        }
+    }
+
+    // Apply material to screen
+    apply_material_to_screen(world);
+}
+
+fn start_display_capture(world: &mut World, screen_index: usize) {
+    info!("Starting display capture for screen {}", screen_index);
+
     let displays = match Display::all() {
         Ok(d) => d,
         Err(e) => {
@@ -59,10 +104,10 @@ pub fn start_screen_capture(world: &mut World) {
         }
     };
 
-    let display = match displays.into_iter().nth(pending.screen_index) {
+    let display = match displays.into_iter().nth(screen_index) {
         Some(d) => d,
         None => {
-            error!("Display {} not found", pending.screen_index);
+            error!("Display {} not found", screen_index);
             return;
         }
     };
@@ -70,7 +115,6 @@ pub fn start_screen_capture(world: &mut World) {
     let width = display.width() as u32;
     let height = display.height() as u32;
 
-    // Create the capturer
     let capturer = match Capturer::new(display) {
         Ok(c) => c,
         Err(e) => {
@@ -79,7 +123,47 @@ pub fn start_screen_capture(world: &mut World) {
         }
     };
 
-    // Create the texture
+    create_capture_texture(world, width, height);
+
+    world.insert_non_send_resource(ActiveDisplayCapture {
+        capturer,
+        width,
+        height,
+        last_capture: Instant::now() - Duration::from_millis(100),
+        capture_interval: Duration::from_millis(33),
+        frame_count: 0,
+        would_block_count: 0,
+    });
+
+    info!("Display capture started: {}x{}", width, height);
+}
+
+fn start_window_capture_impl(world: &mut World, hwnd: isize) {
+    info!("Starting window capture for hwnd {}", hwnd);
+
+    match capture_window(hwnd) {
+        Some((rgba, width, height)) => {
+            info!("Window capture initialized: {}x{}", width, height);
+
+            create_capture_texture(world, width, height);
+            update_texture(world, rgba, width, height, true);
+
+            world.insert_resource(ActiveWindowCapture {
+                hwnd,
+                width,
+                height,
+                last_capture: Instant::now(),
+                capture_interval: Duration::from_millis(33),
+                frame_count: 1,
+            });
+        }
+        None => {
+            error!("Failed to capture window with hwnd {}", hwnd);
+        }
+    }
+}
+
+fn create_capture_texture(world: &mut World, width: u32, height: u32) {
     let size = Extent3d {
         width,
         height,
@@ -89,19 +173,15 @@ pub fn start_screen_capture(world: &mut World) {
     let mut image = Image::new_fill(
         size,
         TextureDimension::D2,
-        &[128, 0, 128, 255], // Start with purple to verify texture is applied
-        TextureFormat::Rgba8Unorm, // Use linear, not sRGB, for screen capture
+        &[64, 64, 64, 255],
+        TextureFormat::Rgba8Unorm,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::COPY_DST
         | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
 
-    info!("Created texture: {}x{}, format={:?}", width, height, image.texture_descriptor.format);
-
-    // Add image and get handle
     let image_handle = world.resource_mut::<Assets<Image>>().add(image);
 
-    // Create material with the texture
     let material = world
         .resource_mut::<Assets<StandardMaterial>>()
         .add(StandardMaterial {
@@ -110,154 +190,110 @@ pub fn start_screen_capture(world: &mut World) {
             ..default()
         });
 
-    // Store the handles
     if let Some(mut screen_texture) = world.get_resource_mut::<ScreenTexture>() {
-        screen_texture.handle = Some(image_handle.clone());
-        screen_texture.material_handle = Some(material.clone());
-        info!("Stored texture handle and material handle in ScreenTexture resource");
-    } else {
-        error!("ScreenTexture resource not found!");
+        screen_texture.handle = Some(image_handle);
+        screen_texture.material_handle = Some(material);
     }
 
-    // Store the active capture as NonSend
-    world.insert_non_send_resource(ActiveCapture {
-        capturer,
-        width,
-        height,
-        screen_index: pending.screen_index,
-        last_capture: Instant::now() - Duration::from_millis(100), // Start immediately
-        capture_interval: Duration::from_millis(33), // ~30 FPS
-        frame_count: 0,
-        material_applied: false,
-        would_block_count: 0,
-        created_at: Instant::now(),
-    });
-
-    info!("Screen capture started: {}x{}", width, height);
+    info!("Created capture texture: {}x{}", width, height);
 }
 
-/// Handle capture events and create pending capture.
-pub fn handle_capture_events(
-    mut events: EventReader<CaptureSource>,
-    mut commands: Commands,
-) {
-    for event in events.read() {
-        commands.insert_resource(PendingCapture {
-            screen_index: event.screen_index,
-        });
-    }
-}
-
-/// Exclusive system to process capture frames on main thread.
-pub fn process_capture_frames(world: &mut World) {
-    // Get the capture resource if it exists
-    let Some(capture) = world.get_non_send_resource_mut::<ActiveCapture>() else {
+fn apply_material_to_screen(world: &mut World) {
+    let screen_texture = world.resource::<ScreenTexture>();
+    let Some(material_handle) = screen_texture.material_handle.clone() else {
         return;
     };
 
-    // Extract values we need
+    let mut query = world.query_filtered::<&mut MeshMaterial3d<StandardMaterial>, With<Screen>>();
+    for mut screen_mat in query.iter_mut(world) {
+        info!("Applying capture material to screen");
+        screen_mat.0 = material_handle.clone();
+    }
+}
+
+fn update_texture(world: &mut World, rgba: Vec<u8>, width: u32, height: u32, log: bool) {
+    let screen_texture = world.resource::<ScreenTexture>();
+    let image_handle = screen_texture.handle.clone();
+    let material_handle = screen_texture.material_handle.clone();
+
+    let expected_size = (width * height * 4) as usize;
+    if rgba.len() != expected_size {
+        error!("RGBA size mismatch: got {}, expected {}", rgba.len(), expected_size);
+        return;
+    }
+
+    let size = Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+
+    let mut new_image = Image::new(
+        size,
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    new_image.texture_descriptor.usage =
+        bevy::render::render_resource::TextureUsages::COPY_DST
+            | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+
+    let new_handle = world.resource_mut::<Assets<Image>>().add(new_image);
+
+    // Remove old image
+    if let Some(old_handle) = image_handle {
+        world.resource_mut::<Assets<Image>>().remove(&old_handle);
+    }
+
+    // Update material
+    if let Some(mat_handle) = material_handle {
+        let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+        if let Some(material) = materials.get_mut(&mat_handle) {
+            material.base_color_texture = Some(new_handle.clone());
+        }
+    }
+
+    // Store new handle
+    if let Some(mut screen_texture) = world.get_resource_mut::<ScreenTexture>() {
+        screen_texture.handle = Some(new_handle);
+    }
+
+    if log {
+        info!("Updated capture texture");
+    }
+}
+
+/// Exclusive system to process display capture frames.
+pub fn process_display_capture(world: &mut World) {
+    let Some(capture) = world.get_non_send_resource::<ActiveDisplayCapture>() else {
+        return;
+    };
+
     let interval = capture.capture_interval;
     let last = capture.last_capture;
     let width = capture.width;
     let height = capture.height;
     let frame_count = capture.frame_count;
-    let screen_index = capture.screen_index;
-    let created_at = capture.created_at;
-    let would_block_count = capture.would_block_count;
 
-    // If we've been waiting too long without any frames, show a test pattern
-    // to verify the texture pipeline works, then try recreating the capturer
-    if frame_count == 0 && created_at.elapsed() > Duration::from_secs(2) && would_block_count > 50 {
-        // Generate a test pattern to verify texture updates work
-        info!("Capturer not receiving frames after 2s, showing test pattern...");
-
-        let mut test_pattern = Vec::with_capacity((width * height * 4) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                // Create a colorful gradient pattern
-                let r = ((x * 255) / width) as u8;
-                let g = ((y * 255) / height) as u8;
-                let b = (((x + y) * 128) / (width + height)) as u8;
-                test_pattern.push(r);
-                test_pattern.push(g);
-                test_pattern.push(b);
-                test_pattern.push(255);
-            }
-        }
-
-        // Update texture with test pattern
-        let screen_texture = world.resource::<ScreenTexture>();
-        if let Some(handle) = screen_texture.handle.clone() {
-            let mut images = world.resource_mut::<Assets<Image>>();
-            if let Some(image) = images.get_mut(&handle) {
-                if image.data.len() == test_pattern.len() {
-                    image.data.copy_from_slice(&test_pattern);
-                    info!("Test pattern applied to texture ({} bytes)", test_pattern.len());
-                } else {
-                    image.data = test_pattern;
-                    info!("Test pattern set on texture (replaced data)");
-                }
-            }
-        }
-
-        // Mark that we've shown the test pattern by incrementing frame_count
-        if let Some(mut capture) = world.get_non_send_resource_mut::<ActiveCapture>() {
-            capture.frame_count = 1; // Prevent showing test pattern repeatedly
-            capture.would_block_count = 0;
-            capture.created_at = Instant::now(); // Reset timer for potential retry
-        }
-
-        // Also apply material if not done yet
-        let material_applied = world
-            .get_non_send_resource::<ActiveCapture>()
-            .map(|c| c.material_applied)
-            .unwrap_or(false);
-
-        if !material_applied {
-            let screen_texture = world.resource::<ScreenTexture>();
-            if let Some(material_handle) = screen_texture.material_handle.clone() {
-                let mut query = world.query_filtered::<&mut MeshMaterial3d<StandardMaterial>, With<Screen>>();
-                for mut screen_mat in query.iter_mut(world) {
-                    info!("Applying material to screen for test pattern");
-                    screen_mat.0 = material_handle.clone();
-                }
-                if let Some(mut capture) = world.get_non_send_resource_mut::<ActiveCapture>() {
-                    capture.material_applied = true;
-                }
-            }
-        }
-
-        return;
-    }
-
-    // Rate limit captures (but not for the first few attempts)
+    // Rate limit (but not for first frames)
     if frame_count > 0 && last.elapsed() < interval {
         return;
     }
 
-    // Try multiple times per system call to increase chances of getting a frame
-    // DXGI only provides frames when screen content changes
     let max_attempts = if frame_count == 0 { 10 } else { 3 };
 
     let frame_data = {
-        let mut capture = world.get_non_send_resource_mut::<ActiveCapture>().unwrap();
+        let mut capture = world.get_non_send_resource_mut::<ActiveDisplayCapture>().unwrap();
         let mut result = None;
 
-        for attempt in 0..max_attempts {
+        for _attempt in 0..max_attempts {
             match capture.capturer.frame() {
                 Ok(frame) => {
-                    // Convert BGRA to RGBA - copy data while we have the frame
-                    // DXGI captures with Y flipped, so we read rows in reverse order
                     let stride = frame.len() / height as usize;
                     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
 
-                    // Log first few frames for debugging
-                    if frame_count < 5 {
-                        info!("Got frame #{} (attempt {}): {} bytes, stride={}, {}x{}",
-                              frame_count, attempt, frame.len(), stride, width, height);
-                    }
-
-                    // Read rows from bottom to top to flip the image
+                    // Read rows in reverse (DXGI is flipped)
                     for y in (0..height as usize).rev() {
                         for x in 0..width as usize {
                             let i = y * stride + x * 4;
@@ -270,32 +306,21 @@ pub fn process_capture_frames(world: &mut World) {
                         }
                     }
 
-                    // Log first few frames for debugging
-                    if frame_count < 5 {
-                        let non_black = rgba.chunks(4).take(100).filter(|p| p[0] > 0 || p[1] > 0 || p[2] > 0).count();
-                        info!("Frame #{}: RGBA {} bytes, first 100 pixels non-black: {}", frame_count, rgba.len(), non_black);
-                    }
-
                     capture.frame_count += 1;
                     capture.would_block_count = 0;
+                    capture.last_capture = Instant::now();
                     result = Some(rgba);
                     break;
                 }
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
                         capture.would_block_count += 1;
-                        // Only log waiting message if we haven't captured any frames yet
-                        if capture.frame_count == 0 {
-                            if capture.would_block_count == 1 {
-                                info!("Capture waiting for first frame... (move a window on the captured display to trigger)");
-                            } else if capture.would_block_count % 300 == 0 {
-                                info!("Still waiting for first frame... (WouldBlock #{})", capture.would_block_count);
-                            }
+                        if capture.frame_count == 0 && capture.would_block_count == 1 {
+                            info!("Display capture waiting for first frame...");
                         }
-                        // Small sleep to avoid tight loop
                         std::thread::sleep(Duration::from_millis(1));
                     } else {
-                        error!("Capture error: {} (kind: {:?})", e, e.kind());
+                        error!("Display capture error: {}", e);
                         break;
                     }
                 }
@@ -304,102 +329,46 @@ pub fn process_capture_frames(world: &mut World) {
         result
     };
 
-    // Update timestamp after the frame is processed
-    if frame_data.is_some() {
-        if let Some(mut capture) = world.get_non_send_resource_mut::<ActiveCapture>() {
-            capture.last_capture = Instant::now();
-        }
-    }
-
-    // Update texture if we got a frame
     if let Some(rgba) = frame_data {
-        let screen_texture = world.resource::<ScreenTexture>();
-        let image_handle = screen_texture.handle.clone();
-        let material_handle = screen_texture.material_handle.clone();
+        let log = frame_count < 5;
+        update_texture(world, rgba, width, height, log);
+    }
+}
 
-        // Update the texture - create new image and update material reference
-        let expected_size = (width * height * 4) as usize;
-        if rgba.len() == expected_size {
-            // Create a new image with the captured data
-            let size = Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            };
+/// System to process window capture frames.
+pub fn process_window_capture(world: &mut World) {
+    // Check if we have an active window capture
+    let capture_info = {
+        let Some(capture) = world.get_resource::<ActiveWindowCapture>() else {
+            return;
+        };
 
-            let mut new_image = Image::new(
-                size,
-                TextureDimension::D2,
-                rgba,
-                TextureFormat::Rgba8Unorm,
-                RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-            );
-            new_image.texture_descriptor.usage =
-                bevy::render::render_resource::TextureUsages::COPY_DST
-                    | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
-
-            // Add as new asset
-            let new_handle = world.resource_mut::<Assets<Image>>().add(new_image);
-
-            // Remove old image if we have one (do this before borrowing materials)
-            if let Some(old_handle) = image_handle.clone() {
-                world.resource_mut::<Assets<Image>>().remove(&old_handle);
-            }
-
-            // Update the material to use the new texture
-            if let Some(mat_handle) = material_handle.clone() {
-                let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
-                if let Some(material) = materials.get_mut(&mat_handle) {
-                    material.base_color_texture = Some(new_handle.clone());
-                    if frame_count < 5 {
-                        info!("Updated material with new texture handle");
-                    }
-                }
-            }
-
-            // Store the new handle
-            if let Some(mut screen_texture) = world.get_resource_mut::<ScreenTexture>() {
-                screen_texture.handle = Some(new_handle);
-            }
-
-            if frame_count < 5 {
-                info!("Created new texture and updated material");
-            }
-        } else {
-            error!("RGBA size mismatch: got {}, expected {}", rgba.len(), expected_size);
+        if capture.last_capture.elapsed() < capture.capture_interval {
+            return;
         }
 
-        // Check if we already applied the material
-        let material_applied = world
-            .get_non_send_resource::<ActiveCapture>()
-            .map(|c| c.material_applied)
-            .unwrap_or(false);
+        (capture.hwnd, capture.frame_count)
+    };
 
-        // Update the screen material (first time only)
-        if let Some(material_handle) = material_handle {
-            if !material_applied {
-                let mut query = world.query_filtered::<&mut MeshMaterial3d<StandardMaterial>, With<Screen>>();
-                let mut found_screen = false;
-                for mut screen_mat in query.iter_mut(world) {
-                    found_screen = true;
-                    info!("Applying capture material to screen (was: {:?})", screen_mat.0);
-                    screen_mat.0 = material_handle.clone();
-                }
-                if found_screen {
-                    if let Some(mut capture) = world.get_non_send_resource_mut::<ActiveCapture>() {
-                        capture.material_applied = true;
-                    }
-                } else {
-                    error!("No Screen entity found to apply material to!");
-                }
-            }
-        } else {
-            error!("No material handle in ScreenTexture");
+    let (hwnd, frame_count) = capture_info;
+
+    // Capture the window
+    if let Some((rgba, width, height)) = capture_window(hwnd) {
+        let log = frame_count < 5;
+        update_texture(world, rgba, width, height, log);
+
+        // Update capture state
+        if let Some(mut capture) = world.get_resource_mut::<ActiveWindowCapture>() {
+            capture.last_capture = Instant::now();
+            capture.frame_count += 1;
+            capture.width = width;
+            capture.height = height;
         }
     }
 }
 
 pub fn cleanup_capture(world: &mut World) {
-    world.remove_non_send_resource::<ActiveCapture>();
+    world.remove_non_send_resource::<ActiveDisplayCapture>();
+    world.remove_resource::<ActiveWindowCapture>();
     world.remove_resource::<PendingCapture>();
 }

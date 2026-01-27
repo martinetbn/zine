@@ -4451,6 +4451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "win-screenshot"
+version = "4.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46fb2d7cb00430b7c433b05cc37a0f2f03a5305a975b1886a6ce5e1d8977d4b"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "winapi"
 version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5047,6 +5056,8 @@ dependencies = [
  "scrap",
  "serde",
  "serde_json",
+ "win-screenshot",
+ "winapi 0.3.9",
 ]
 
 [[package]]

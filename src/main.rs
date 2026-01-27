@@ -3,6 +3,7 @@ mod game_state;
 mod menu;
 mod network;
 mod player;
+mod screen;
 mod world;
 
 use bevy::{
@@ -16,6 +17,7 @@ use game_state::AppState;
 use menu::MenuPlugin;
 use network::NetworkPlugin;
 use player::PlayerPlugin;
+use screen::ScreenPlugin;
 use world::WorldPlugin;
 
 fn main() {
@@ -41,6 +43,7 @@ fn main() {
             WorldPlugin,
             PlayerPlugin,
             CameraPlugin,
+            ScreenPlugin,
         ))
         .run();
 }

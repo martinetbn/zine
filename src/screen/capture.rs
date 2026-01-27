@@ -3,6 +3,9 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::world::Screen;
@@ -39,15 +42,22 @@ pub struct ActiveDisplayCapture {
     pub would_block_count: u32,
 }
 
-/// Resource for active window capture
+/// Captured frame data from background thread
+pub struct CapturedFrame {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Resource for active window capture with background thread
 #[derive(Resource)]
 pub struct ActiveWindowCapture {
     pub hwnd: isize,
     pub width: u32,
     pub height: u32,
-    pub last_capture: Instant,
-    pub capture_interval: Duration,
     pub frame_count: u32,
+    pub frame_receiver: Mutex<Receiver<CapturedFrame>>,
+    pub stop_sender: Mutex<Sender<()>>,
 }
 
 /// Resource to signal that capture should start.
@@ -77,6 +87,12 @@ pub fn start_capture(world: &mut World) {
     };
 
     // Clean up any existing captures
+    // Stop background window capture thread if running
+    if let Some(capture) = world.get_resource::<ActiveWindowCapture>() {
+        if let Ok(sender) = capture.stop_sender.lock() {
+            let _ = sender.send(());
+        }
+    }
     world.remove_non_send_resource::<ActiveDisplayCapture>();
     world.remove_resource::<ActiveWindowCapture>();
 
@@ -141,6 +157,7 @@ fn start_display_capture(world: &mut World, screen_index: usize) {
 fn start_window_capture_impl(world: &mut World, hwnd: isize) {
     info!("Starting window capture for hwnd {}", hwnd);
 
+    // Capture first frame to get dimensions
     match capture_window(hwnd) {
         Some((rgba, width, height)) => {
             info!("Window capture initialized: {}x{}", width, height);
@@ -148,13 +165,46 @@ fn start_window_capture_impl(world: &mut World, hwnd: isize) {
             create_capture_texture(world, width, height);
             update_texture(world, rgba, width, height, true);
 
+            // Create channels for background capture
+            let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>();
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+            // Spawn background capture thread
+            let capture_hwnd = hwnd;
+            thread::spawn(move || {
+                let interval = Duration::from_millis(33); // ~30fps
+                loop {
+                    // Check for stop signal
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+
+                    let start = Instant::now();
+
+                    // Capture window
+                    if let Some((rgba, width, height)) = capture_window(capture_hwnd) {
+                        let frame = CapturedFrame { rgba, width, height };
+                        if frame_tx.send(frame).is_err() {
+                            // Receiver dropped, exit thread
+                            break;
+                        }
+                    }
+
+                    // Sleep to maintain target framerate
+                    let elapsed = start.elapsed();
+                    if elapsed < interval {
+                        thread::sleep(interval - elapsed);
+                    }
+                }
+            });
+
             world.insert_resource(ActiveWindowCapture {
                 hwnd,
                 width,
                 height,
-                last_capture: Instant::now(),
-                capture_interval: Duration::from_millis(33),
                 frame_count: 1,
+                frame_receiver: Mutex::new(frame_rx),
+                stop_sender: Mutex::new(stop_tx),
             });
         }
         None => {
@@ -335,39 +385,46 @@ pub fn process_display_capture(world: &mut World) {
     }
 }
 
-/// System to process window capture frames.
+/// System to process window capture frames (receives from background thread).
 pub fn process_window_capture(world: &mut World) {
-    // Check if we have an active window capture
-    let capture_info = {
+    // Check if we have an active window capture and try to receive a frame
+    let frame_data = {
         let Some(capture) = world.get_resource::<ActiveWindowCapture>() else {
             return;
         };
 
-        if capture.last_capture.elapsed() < capture.capture_interval {
-            return;
+        // Non-blocking receive - get the latest frame if available
+        let mut latest_frame = None;
+        if let Ok(receiver) = capture.frame_receiver.lock() {
+            while let Ok(frame) = receiver.try_recv() {
+                latest_frame = Some(frame);
+            }
         }
 
-        (capture.hwnd, capture.frame_count)
+        latest_frame.map(|f| (f, capture.frame_count))
     };
 
-    let (hwnd, frame_count) = capture_info;
-
-    // Capture the window
-    if let Some((rgba, width, height)) = capture_window(hwnd) {
+    if let Some((frame, frame_count)) = frame_data {
         let log = frame_count < 5;
-        update_texture(world, rgba, width, height, log);
+        update_texture(world, frame.rgba, frame.width, frame.height, log);
 
         // Update capture state
         if let Some(mut capture) = world.get_resource_mut::<ActiveWindowCapture>() {
-            capture.last_capture = Instant::now();
             capture.frame_count += 1;
-            capture.width = width;
-            capture.height = height;
+            capture.width = frame.width;
+            capture.height = frame.height;
         }
     }
 }
 
 pub fn cleanup_capture(world: &mut World) {
+    // Stop background window capture thread if running
+    if let Some(capture) = world.get_resource::<ActiveWindowCapture>() {
+        if let Ok(sender) = capture.stop_sender.lock() {
+            let _ = sender.send(());
+        }
+    }
+
     world.remove_non_send_resource::<ActiveDisplayCapture>();
     world.remove_resource::<ActiveWindowCapture>();
     world.remove_resource::<PendingCapture>();

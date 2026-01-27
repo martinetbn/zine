@@ -5,7 +5,7 @@ pub mod setup;
 
 use bevy::prelude::*;
 
-pub use components::{Interactable, Screen, ScreenControlButton};
+pub use components::{Interactable, Screen, ScreenControlButton, ScreenFrame};
 pub use interaction::ScreenControlEvent;
 
 use crate::game_state::AppState;

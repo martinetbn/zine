@@ -8,6 +8,15 @@ pub struct Screen;
 #[derive(Component)]
 pub struct ScreenControlButton;
 
+/// Identifies which side of the screen frame this entity represents.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenFrame {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
 /// Component for interactable objects that can be right-clicked.
 #[derive(Component)]
 pub struct Interactable {

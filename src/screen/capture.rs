@@ -9,8 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::world::Screen;
+use crate::world::setup::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use super::streaming::LatestCapturedFrame;
 use super::window_capture::capture_window;
+use super::ScreenDimensions;
 
 /// Type of capture source
 #[derive(Clone, Copy, Debug)]
@@ -269,6 +271,33 @@ fn update_texture(world: &mut World, rgba: Vec<u8>, width: u32, height: u32, log
         latest_frame.width = width;
         latest_frame.height = height;
         latest_frame.frame_number += 1;
+    }
+
+    // Update screen dimensions for aspect ratio adjustment
+    let video_aspect = width as f32 / height as f32;
+    let base_aspect = SCREEN_WIDTH / SCREEN_HEIGHT;
+
+    let (new_width, new_height) = if video_aspect >= base_aspect {
+        // Video is wider than or equal to base - constrain by width
+        (SCREEN_WIDTH, SCREEN_WIDTH / video_aspect)
+    } else {
+        // Video is taller than base - constrain by height
+        (SCREEN_HEIGHT * video_aspect, SCREEN_HEIGHT)
+    };
+
+    if let Some(mut screen_dims) = world.get_resource_mut::<ScreenDimensions>() {
+        if !screen_dims.initialized
+            || (screen_dims.width - new_width).abs() > 0.01
+            || (screen_dims.height - new_height).abs() > 0.01
+        {
+            info!(
+                "Adjusting screen for {}x{} capture (aspect {:.3}): screen {:.2}x{:.2}",
+                width, height, video_aspect, new_width, new_height
+            );
+            screen_dims.width = new_width;
+            screen_dims.height = new_height;
+            screen_dims.initialized = true;
+        }
     }
 
     let screen_texture = world.resource::<ScreenTexture>();

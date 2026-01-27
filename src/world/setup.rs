@@ -2,17 +2,19 @@ use bevy::prelude::*;
 
 use crate::player::{CameraController, Player, Velocity, PLAYER_HEIGHT};
 
-use super::components::{Interactable, Screen, ScreenControlButton};
+use super::components::{Interactable, Screen, ScreenControlButton, ScreenFrame};
 use super::{ROOM_DEPTH, ROOM_HEIGHT, ROOM_WIDTH, WALL_THICKNESS};
 
-// Screen dimensions
-const SCREEN_WIDTH: f32 = 6.0;
-const SCREEN_HEIGHT: f32 = 3.0;
-const SCREEN_Y: f32 = 2.2; // Center height of the screen
+// Screen dimensions (base dimensions, can be scaled by aspect ratio)
+pub const SCREEN_WIDTH: f32 = 6.0;
+pub const SCREEN_HEIGHT: f32 = 3.0;
+pub const SCREEN_Y: f32 = 2.2; // Center height of the screen
+pub const SCREEN_DEPTH: f32 = 0.05;
+pub const FRAME_THICKNESS: f32 = 0.08;
 
 // Control button dimensions
-const BUTTON_SIZE: f32 = 0.3;
-const BUTTON_OFFSET_X: f32 = 0.3; // Distance from screen edge
+pub const BUTTON_SIZE: f32 = 0.3;
+pub const BUTTON_OFFSET_X: f32 = 0.3; // Distance from screen edge
 
 pub fn setup_world(
     mut commands: Commands,
@@ -96,7 +98,7 @@ pub fn setup_world(
 
     commands.spawn((
         Screen,
-        Mesh3d(meshes.add(Cuboid::new(SCREEN_WIDTH, SCREEN_HEIGHT, 0.05))),
+        Mesh3d(meshes.add(Cuboid::new(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_DEPTH))),
         MeshMaterial3d(screen_material),
         Transform::from_xyz(0.0, SCREEN_Y, -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.03),
     ));
@@ -107,46 +109,55 @@ pub fn setup_world(
         ..default()
     });
 
-    let frame_thickness = 0.08;
+    let frame_z = -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.02;
+
     // Top frame
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(SCREEN_WIDTH + frame_thickness * 2.0, frame_thickness, 0.06))),
+        ScreenFrame::Top,
+        Mesh3d(meshes.add(Cuboid::new(
+            SCREEN_WIDTH + FRAME_THICKNESS * 2.0,
+            FRAME_THICKNESS,
+            0.06,
+        ))),
         MeshMaterial3d(frame_material.clone()),
         Transform::from_xyz(
             0.0,
-            SCREEN_Y + SCREEN_HEIGHT / 2.0 + frame_thickness / 2.0,
-            -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.02,
+            SCREEN_Y + SCREEN_HEIGHT / 2.0 + FRAME_THICKNESS / 2.0,
+            frame_z,
         ),
     ));
     // Bottom frame
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(SCREEN_WIDTH + frame_thickness * 2.0, frame_thickness, 0.06))),
+        ScreenFrame::Bottom,
+        Mesh3d(meshes.add(Cuboid::new(
+            SCREEN_WIDTH + FRAME_THICKNESS * 2.0,
+            FRAME_THICKNESS,
+            0.06,
+        ))),
         MeshMaterial3d(frame_material.clone()),
         Transform::from_xyz(
             0.0,
-            SCREEN_Y - SCREEN_HEIGHT / 2.0 - frame_thickness / 2.0,
-            -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.02,
+            SCREEN_Y - SCREEN_HEIGHT / 2.0 - FRAME_THICKNESS / 2.0,
+            frame_z,
         ),
     ));
     // Left frame
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(frame_thickness, SCREEN_HEIGHT, 0.06))),
+        ScreenFrame::Left,
+        Mesh3d(meshes.add(Cuboid::new(FRAME_THICKNESS, SCREEN_HEIGHT, 0.06))),
         MeshMaterial3d(frame_material.clone()),
         Transform::from_xyz(
-            -SCREEN_WIDTH / 2.0 - frame_thickness / 2.0,
+            -SCREEN_WIDTH / 2.0 - FRAME_THICKNESS / 2.0,
             SCREEN_Y,
-            -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.02,
+            frame_z,
         ),
     ));
     // Right frame
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(frame_thickness, SCREEN_HEIGHT, 0.06))),
+        ScreenFrame::Right,
+        Mesh3d(meshes.add(Cuboid::new(FRAME_THICKNESS, SCREEN_HEIGHT, 0.06))),
         MeshMaterial3d(frame_material),
-        Transform::from_xyz(
-            SCREEN_WIDTH / 2.0 + frame_thickness / 2.0,
-            SCREEN_Y,
-            -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.02,
-        ),
+        Transform::from_xyz(SCREEN_WIDTH / 2.0 + FRAME_THICKNESS / 2.0, SCREEN_Y, frame_z),
     ));
 
     // Screen control button (right side of screen)
@@ -165,7 +176,7 @@ pub fn setup_world(
         Mesh3d(meshes.add(Cuboid::new(BUTTON_SIZE, BUTTON_SIZE, 0.05))),
         MeshMaterial3d(button_material),
         Transform::from_xyz(
-            SCREEN_WIDTH / 2.0 + frame_thickness + BUTTON_OFFSET_X + BUTTON_SIZE / 2.0,
+            SCREEN_WIDTH / 2.0 + FRAME_THICKNESS + BUTTON_OFFSET_X + BUTTON_SIZE / 2.0,
             SCREEN_Y - SCREEN_HEIGHT / 2.0 + BUTTON_SIZE / 2.0,
             -ROOM_DEPTH / 2.0 + WALL_THICKNESS / 2.0 + 0.03,
         ),

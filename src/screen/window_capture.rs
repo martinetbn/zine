@@ -101,9 +101,9 @@ fn capture_window_impl(hwnd: isize) -> Option<(Vec<u8>, u32, u32)> {
                 for x in 0..width {
                     let i = ((y * width + x) * 4) as usize;
                     if i + 3 < buf.pixels.len() {
-                        rgba.push(buf.pixels[i + 2]); // R
+                        rgba.push(buf.pixels[i]);     // R (win-screenshot uses RGBA)
                         rgba.push(buf.pixels[i + 1]); // G
-                        rgba.push(buf.pixels[i]);     // B
+                        rgba.push(buf.pixels[i + 2]); // B
                         rgba.push(buf.pixels[i + 3]); // A
                     }
                 }
@@ -129,9 +129,9 @@ fn capture_window_impl(hwnd: isize) -> Option<(Vec<u8>, u32, u32)> {
                         for x in 0..width {
                             let i = ((y * width + x) * 4) as usize;
                             if i + 3 < buf.pixels.len() {
-                                rgba.push(buf.pixels[i + 2]); // R
+                                rgba.push(buf.pixels[i]);     // R (win-screenshot uses RGBA)
                                 rgba.push(buf.pixels[i + 1]); // G
-                                rgba.push(buf.pixels[i]);     // B
+                                rgba.push(buf.pixels[i + 2]); // B
                                 rgba.push(buf.pixels[i + 3]); // A
                             }
                         }

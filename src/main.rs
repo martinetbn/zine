@@ -1,4 +1,7 @@
 mod camera;
+mod game_state;
+mod menu;
+mod network;
 mod player;
 mod world;
 
@@ -9,6 +12,9 @@ use bevy::{
 };
 
 use camera::CameraPlugin;
+use game_state::AppState;
+use menu::MenuPlugin;
+use network::NetworkPlugin;
 use player::PlayerPlugin;
 use world::WorldPlugin;
 
@@ -28,6 +34,13 @@ fn main() {
             FrameTimeDiagnosticsPlugin::default(),
             LogDiagnosticsPlugin::default(),
         ))
-        .add_plugins((WorldPlugin, PlayerPlugin, CameraPlugin))
+        .init_state::<AppState>()
+        .add_plugins((
+            MenuPlugin,
+            NetworkPlugin,
+            WorldPlugin,
+            PlayerPlugin,
+            CameraPlugin,
+        ))
         .run();
 }

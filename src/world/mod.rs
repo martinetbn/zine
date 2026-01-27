@@ -2,6 +2,7 @@ pub mod setup;
 
 use bevy::prelude::*;
 
+use crate::game_state::AppState;
 use setup::setup_world;
 
 // Room dimensions
@@ -18,6 +19,6 @@ pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_world);
+        app.add_systems(OnEnter(AppState::InGame), setup_world);
     }
 }

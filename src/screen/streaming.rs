@@ -16,11 +16,11 @@ use crate::network::protocol::ScreenFragment;
 const FRAGMENT_SIZE: usize = 4000;
 
 /// Minimum JPEG quality.
-const MIN_QUALITY: u8 = 40;
+const MIN_QUALITY: u8 = 30;
 /// Maximum JPEG quality.
-const MAX_QUALITY: u8 = 85;
+const MAX_QUALITY: u8 = 80;
 /// Starting JPEG quality.
-const INITIAL_QUALITY: u8 = 70;
+const INITIAL_QUALITY: u8 = 60;
 
 /// Resource holding the latest captured frame for streaming.
 #[derive(Resource, Default)]
@@ -44,7 +44,7 @@ impl Default for ScreenStreamState {
         Self {
             frame_id: 0,
             last_stream_time: Instant::now() - Duration::from_secs(1),
-            stream_interval: Duration::from_millis(33), // ~30fps target
+            stream_interval: Duration::from_millis(25), // ~40fps target
         }
     }
 }
@@ -342,9 +342,9 @@ pub struct JitterBuffer {
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self {
-            frames: VecDeque::with_capacity(8),
-            target_size: 2, // Buffer 2 frames (~66ms at 30fps)
-            min_delay: Duration::from_millis(30),
+            frames: VecDeque::with_capacity(4),
+            target_size: 1, // Buffer 1 frame for minimal latency
+            min_delay: Duration::from_millis(16), // ~60fps timing
             last_released_id: 0,
         }
     }

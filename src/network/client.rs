@@ -10,6 +10,8 @@ use crate::game_state::AppState;
 use crate::player::Player;
 use crate::screen::streaming::{decode_jpeg_to_rgba, FrameAssembler, JitterBuffer};
 
+use crate::screen::video_decoder::{VideoDecoder, VideoJitterBuffer};
+
 /// Resource indicating this instance is a client.
 #[derive(Resource)]
 pub struct GameClient {
@@ -26,12 +28,13 @@ pub fn client_plugin(app: &mut App) {
         .add_systems(
             Update,
             (client_receive, client_connect_check).run_if(in_state(AppState::Connecting)),
-        )
-        .add_systems(
-            Update,
-            (client_receive, send_player_update, process_jitter_buffer)
-                .run_if(in_state(AppState::InGame).and(resource_exists::<GameClient>)),
         );
+
+    app.add_systems(
+        Update,
+        (client_receive, send_player_update, process_jitter_buffer, process_video_decoder)
+            .run_if(in_state(AppState::InGame).and(resource_exists::<GameClient>)),
+    );
 }
 
 fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) {
@@ -90,6 +93,11 @@ fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) 
     commands.insert_resource(FrameAssembler::default());
     commands.insert_resource(JitterBuffer::default());
 
+    if let Some(decoder) = VideoDecoder::new() {
+        commands.insert_resource(decoder);
+        commands.insert_resource(VideoJitterBuffer::default());
+    }
+
     info!("Connecting to server at {}", selected.0.address);
 }
 
@@ -101,6 +109,8 @@ fn cleanup_client(mut commands: Commands) {
     commands.remove_resource::<ClientSyncTimer>();
     commands.remove_resource::<FrameAssembler>();
     commands.remove_resource::<JitterBuffer>();
+    commands.remove_resource::<VideoDecoder>();
+    commands.remove_resource::<VideoJitterBuffer>();
 }
 
 /// Event to update the screen texture with received frame data.
@@ -118,6 +128,7 @@ fn client_receive(
     local_id: Option<Res<LocalPlayerId>>,
     mut frame_assembler: Option<ResMut<FrameAssembler>>,
     mut jitter_buffer: Option<ResMut<JitterBuffer>>,
+    mut video_decoder: Option<ResMut<VideoDecoder>>,
 ) {
     let Some(client) = client else { return };
 
@@ -153,11 +164,20 @@ fn client_receive(
                                 if let Some((jpeg_data, width, height, frame_id)) =
                                     assembler.add_fragment(fragment)
                                 {
-                                    // Add complete frame to jitter buffer
                                     if let Some(ref mut jitter) = jitter_buffer {
                                         jitter.push_frame(jpeg_data, width, height, frame_id);
                                     }
                                 }
+                            }
+                        }
+                        ServerMessage::VideoFrame(chunk) => {
+                            if let Some(ref mut decoder) = video_decoder {
+                                decoder.add_chunk(chunk);
+                            }
+                        }
+                        ServerMessage::VideoCodec(info) => {
+                            if let Some(ref mut decoder) = video_decoder {
+                                decoder.set_codec_info(info);
                             }
                         }
                     }
@@ -224,6 +244,33 @@ fn process_jitter_buffer(
                 rgba,
                 width: w,
                 height: h,
+            });
+        }
+    }
+}
+
+/// Process hardware-decoded video frames
+fn process_video_decoder(
+    mut decoder: Option<ResMut<VideoDecoder>>,
+    mut jitter: Option<ResMut<VideoJitterBuffer>>,
+    mut screen_frame_events: EventWriter<ReceivedScreenFrame>,
+) {
+    // Get decoded frames from decoder and add to jitter buffer
+    if let Some(ref mut decoder) = decoder {
+        while let Some(frame) = decoder.get_decoded() {
+            if let Some(ref mut jitter) = jitter {
+                jitter.push(frame);
+            }
+        }
+    }
+
+    // Pop frames from jitter buffer
+    if let Some(ref mut jitter) = jitter {
+        if let Some(frame) = jitter.pop() {
+            screen_frame_events.send(ReceivedScreenFrame {
+                rgba: frame.rgba,
+                width: frame.width,
+                height: frame.height,
             });
         }
     }

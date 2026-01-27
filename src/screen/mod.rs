@@ -1,6 +1,8 @@
 pub mod capture;
 pub mod share_ui;
 pub mod streaming;
+pub mod video_decoder;
+pub mod video_encoder;
 pub mod window_capture;
 
 use bevy::prelude::*;

@@ -42,6 +42,13 @@ pub struct RemotePlayer {
     pub id: PlayerId,
 }
 
+/// Component storing the target transform for interpolation.
+#[derive(Component)]
+pub struct NetworkTransform {
+    pub target_position: Vec3,
+    pub target_yaw: f32,
+}
+
 /// Resource tracking all known remote players for the client.
 #[derive(Resource, Default)]
 pub struct RemotePlayers {

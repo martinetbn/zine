@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::discovery::SelectedSession;
 use super::protocol::{
-    ClientMessage, LocalPlayerId, PlayerState, RemotePlayer, RemotePlayers, ServerMessage,
+    ClientMessage, LocalPlayerId, NetworkTransform, RemotePlayer, RemotePlayers, ServerMessage,
 };
 use crate::game_state::AppState;
 use crate::player::Player;
@@ -163,11 +163,14 @@ fn send_player_update(
     }
 }
 
-/// System to spawn/update remote player visuals.
+/// Interpolation speed - higher = faster catch-up, lower = smoother but more latency.
+const INTERPOLATION_SPEED: f32 = 15.0;
+
+/// System to spawn/update remote player visuals (sets network targets).
 pub fn update_remote_player_visuals(
     mut commands: Commands,
     remote_players: Option<Res<RemotePlayers>>,
-    mut remote_query: Query<(Entity, &RemotePlayer, &mut Transform)>,
+    mut remote_query: Query<(Entity, &RemotePlayer, &mut NetworkTransform)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -179,28 +182,32 @@ pub fn update_remote_player_visuals(
         return;
     }
 
-    let existing_ids: Vec<u64> = remote_query.iter().map(|(_, rp, _)| rp.id).collect();
-
     for player_state in &remote_players.players {
-        if let Some((_, _, mut transform)) = remote_query
+        let mut target_pos = Vec3::from_array(player_state.position);
+        target_pos.y -= 0.9; // Offset to ground level for the mesh
+
+        if let Some((_, _, mut net_transform)) = remote_query
             .iter_mut()
             .find(|(_, rp, _)| rp.id == player_state.id)
         {
-            // Update existing remote player
-            transform.translation = Vec3::from_array(player_state.position);
-            transform.translation.y -= 0.9; // Offset to ground level for the mesh
-            transform.rotation = Quat::from_rotation_y(player_state.yaw);
+            // Update target for existing remote player
+            net_transform.target_position = target_pos;
+            net_transform.target_yaw = player_state.yaw;
         } else {
-            // Spawn new remote player
+            // Spawn new remote player with NetworkTransform
             info!("Spawning remote player {}", player_state.id);
             commands.spawn((
                 RemotePlayer { id: player_state.id },
+                NetworkTransform {
+                    target_position: target_pos,
+                    target_yaw: player_state.yaw,
+                },
                 Mesh3d(meshes.add(Capsule3d::new(0.4, 1.0))),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: Color::srgb(0.2, 0.6, 0.8),
                     ..default()
                 })),
-                Transform::from_translation(Vec3::from_array(player_state.position))
+                Transform::from_translation(target_pos)
                     .with_rotation(Quat::from_rotation_y(player_state.yaw)),
             ));
         }
@@ -212,5 +219,25 @@ pub fn update_remote_player_visuals(
         if !current_ids.contains(&rp.id) {
             commands.entity(entity).despawn_recursive();
         }
+    }
+}
+
+/// System to smoothly interpolate remote players towards their target transforms.
+pub fn interpolate_remote_players(
+    time: Res<Time>,
+    mut query: Query<(&mut Transform, &NetworkTransform), With<RemotePlayer>>,
+) {
+    let dt = time.delta_secs();
+    let t = (INTERPOLATION_SPEED * dt).min(1.0);
+
+    for (mut transform, net_transform) in query.iter_mut() {
+        // Lerp position
+        transform.translation = transform
+            .translation
+            .lerp(net_transform.target_position, t);
+
+        // Slerp rotation (smoothly interpolate yaw)
+        let target_rotation = Quat::from_rotation_y(net_transform.target_yaw);
+        transform.rotation = transform.rotation.slerp(target_rotation, t);
     }
 }

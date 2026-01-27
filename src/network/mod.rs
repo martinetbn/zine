@@ -9,7 +9,7 @@ pub use discovery::{DiscoveredSessions, LanSession, SelectedSession};
 pub use protocol::{LocalPlayerId, RemotePlayer, RemotePlayers};
 
 use crate::game_state::AppState;
-use client::update_remote_player_visuals;
+use client::{interpolate_remote_players, update_remote_player_visuals};
 use discovery::{
     broadcast_session, cleanup_broadcast, cleanup_listener, listen_for_sessions, setup_broadcast,
     setup_listener,
@@ -31,7 +31,8 @@ impl Plugin for NetworkPlugin {
         // Remote player visuals (for both host and client)
         app.add_systems(
             Update,
-            update_remote_player_visuals.run_if(in_state(AppState::InGame)),
+            (update_remote_player_visuals, interpolate_remote_players)
+                .run_if(in_state(AppState::InGame)),
         );
 
         // Host also needs RemotePlayers to see clients

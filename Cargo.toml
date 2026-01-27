@@ -1,0 +1,18 @@
+[package]
+name = "zine"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+dev = ["bevy/dynamic_linking"]
+
+[dependencies]
+bevy = "0.15"
+
+# Enable optimizations for better runtime performance in dev
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

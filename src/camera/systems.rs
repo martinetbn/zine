@@ -4,7 +4,7 @@ use crate::player::{CameraController, Player, MOUSE_SENSITIVITY, PITCH_LIMIT};
 
 pub fn grab_cursor(mut windows: Query<&mut Window>) {
     let mut window = windows.single_mut();
-    window.cursor_options.grab_mode = CursorGrabMode::Locked;
+    window.cursor_options.grab_mode = CursorGrabMode::Confined;
     window.cursor_options.visible = false;
 }
 
@@ -13,7 +13,7 @@ pub fn toggle_cursor_grab(keyboard_input: Res<ButtonInput<KeyCode>>, mut windows
         let mut window = windows.single_mut();
         match window.cursor_options.grab_mode {
             CursorGrabMode::None => {
-                window.cursor_options.grab_mode = CursorGrabMode::Locked;
+                window.cursor_options.grab_mode = CursorGrabMode::Confined;
                 window.cursor_options.visible = false;
             }
             _ => {

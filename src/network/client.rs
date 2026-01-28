@@ -6,6 +6,7 @@ use super::discovery::SelectedSession;
 use super::protocol::{
     ClientMessage, LocalPlayerId, NetworkTransform, RemotePlayer, RemotePlayers, ServerMessage,
 };
+use crate::character::{CharacterAssets, CharacterAnimationState, NeedsAnimationSetup};
 use crate::game_state::AppState;
 use crate::player::Player;
 
@@ -350,9 +351,8 @@ fn process_video_decoder(
     };
 
     if should_log {
-        let decoded = DECODED_FPS_COUNTER.swap(0, Ordering::Relaxed);
-        let displayed = DISPLAYED_FPS_COUNTER.swap(0, Ordering::Relaxed);
-        info!("Client video FPS - decoded: {}, displayed: {}", decoded, displayed);
+        DECODED_FPS_COUNTER.swap(0, Ordering::Relaxed);
+        DISPLAYED_FPS_COUNTER.swap(0, Ordering::Relaxed);
     }
 }
 
@@ -363,9 +363,8 @@ const INTERPOLATION_SPEED: f32 = 15.0;
 pub fn update_remote_player_visuals(
     mut commands: Commands,
     remote_players: Option<Res<RemotePlayers>>,
-    mut remote_query: Query<(Entity, &RemotePlayer, &mut NetworkTransform)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut remote_query: Query<(Entity, &RemotePlayer, &mut NetworkTransform, &mut CharacterAnimationState)>,
+    character_assets: Option<Res<CharacterAssets>>,
 ) {
     let Some(remote_players) = remote_players else {
         return;
@@ -375,40 +374,77 @@ pub fn update_remote_player_visuals(
         return;
     }
 
-    for player_state in &remote_players.players {
-        let mut target_pos = Vec3::from_array(player_state.position);
-        target_pos.y -= 0.9; // Offset to ground level for the mesh
+    // Player height constant (eye level above feet)
+    const PLAYER_HEIGHT: f32 = 1.8;
+    // Model pivot offset (adjust if character floats or clips)
+    const MODEL_OFFSET: f32 = -0.15;
 
-        if let Some((_, _, mut net_transform)) = remote_query
+    for player_state in &remote_players.players {
+        // Convert from eye position to character feet position
+        let target_pos = Vec3::new(
+            player_state.position[0],
+            player_state.position[1] - PLAYER_HEIGHT + MODEL_OFFSET,
+            player_state.position[2],
+        );
+
+        // Add PI to yaw to flip the character to face the correct direction
+        let corrected_yaw = player_state.yaw + std::f32::consts::PI;
+
+        if let Some((_, _, mut net_transform, mut anim_state)) = remote_query
             .iter_mut()
-            .find(|(_, rp, _)| rp.id == player_state.id)
+            .find(|(_, rp, _, _)| rp.id == player_state.id)
         {
+            // Check if player is moving (for animation state)
+            let distance = net_transform.target_position.distance(target_pos);
+
+            // If significant movement detected, mark as walking and update timestamp
+            if distance > 0.05 {
+                anim_state.is_walking = true;
+                anim_state.last_walk_time = 0.0; // Will be updated by decay system
+            }
+
             // Update target for existing remote player
             net_transform.target_position = target_pos;
-            net_transform.target_yaw = player_state.yaw;
+            net_transform.target_yaw = corrected_yaw;
         } else {
-            // Spawn new remote player with NetworkTransform
+            // Spawn new remote player with character model
             info!("Spawning remote player {}", player_state.id);
-            commands.spawn((
-                RemotePlayer { id: player_state.id },
-                NetworkTransform {
-                    target_position: target_pos,
-                    target_yaw: player_state.yaw,
-                },
-                Mesh3d(meshes.add(Capsule3d::new(0.4, 1.0))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.2, 0.6, 0.8),
-                    ..default()
-                })),
-                Transform::from_translation(target_pos)
-                    .with_rotation(Quat::from_rotation_y(player_state.yaw)),
-            ));
+
+            // Add character scene if assets are loaded
+            if let Some(ref assets) = character_assets {
+                commands.spawn((
+                    RemotePlayer { id: player_state.id },
+                    NetworkTransform {
+                        target_position: target_pos,
+                        target_yaw: corrected_yaw,
+                    },
+                    CharacterAnimationState::default(),
+                    Transform::from_translation(target_pos)
+                        .with_rotation(Quat::from_rotation_y(corrected_yaw))
+                        .with_scale(Vec3::splat(1.0)), // Character scale
+                    SceneRoot(assets.scene.clone()),
+                    NeedsAnimationSetup,
+                ));
+            } else {
+                // Fallback: spawn without character model (will be added later)
+                warn!("Character assets not loaded yet, spawning player without model");
+                commands.spawn((
+                    RemotePlayer { id: player_state.id },
+                    NetworkTransform {
+                        target_position: target_pos,
+                        target_yaw: corrected_yaw,
+                    },
+                    CharacterAnimationState::default(),
+                    Transform::from_translation(target_pos)
+                        .with_rotation(Quat::from_rotation_y(corrected_yaw)),
+                ));
+            }
         }
     }
 
     // Remove players that left
     let current_ids: Vec<u64> = remote_players.players.iter().map(|p| p.id).collect();
-    for (entity, rp, _) in remote_query.iter() {
+    for (entity, rp, _, _) in remote_query.iter() {
         if !current_ids.contains(&rp.id) {
             commands.entity(entity).despawn_recursive();
         }

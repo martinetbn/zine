@@ -407,9 +407,8 @@ fn broadcast_video_frames(
     };
 
     if should_log {
-        let submitted = SUBMITTED_FPS.swap(0, Ordering::Relaxed);
-        let sent = SENT_FPS.swap(0, Ordering::Relaxed);
-        info!("Server video FPS - submitted: {}, sent: {}", submitted, sent);
+        SUBMITTED_FPS.swap(0, Ordering::Relaxed);
+        SENT_FPS.swap(0, Ordering::Relaxed);
     }
 }
 

@@ -1,3 +1,5 @@
+use bevy::input::keyboard::KeyboardInput;
+use bevy::input::ButtonState;
 use bevy::prelude::*;
 
 use super::components::{
@@ -8,6 +10,7 @@ use crate::world::ROOM_HALF_WIDTH;
 
 pub fn player_movement(
     keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut keyboard_events: EventReader<KeyboardInput>,
     mut query: Query<(&Transform, &mut Velocity), With<Player>>,
 ) {
     let (transform, mut velocity) = query.single_mut();
@@ -44,12 +47,16 @@ pub fn player_movement(
     velocity.0.x = move_direction.x * PLAYER_SPEED;
     velocity.0.z = move_direction.z * PLAYER_SPEED;
 
-    // Jump (only when grounded)
+    // Jump using raw keyboard events (bypasses ButtonInput state issues on Windows)
     let is_grounded = transform.translation.y <= GROUND_LEVEL + PLAYER_HEIGHT + 0.01;
-    if keyboard_input.just_pressed(KeyCode::Space) && is_grounded {
-        velocity.0.y = JUMP_VELOCITY;
+
+    for event in keyboard_events.read() {
+        if event.key_code == KeyCode::Space && event.state == ButtonState::Pressed && is_grounded {
+            velocity.0.y = JUMP_VELOCITY;
+        }
     }
 }
+
 
 pub fn apply_gravity(time: Res<Time>, mut query: Query<(&Transform, &mut Velocity), With<Player>>) {
     let (transform, mut velocity) = query.single_mut();

@@ -1,4 +1,5 @@
 mod camera;
+mod character;
 mod game_state;
 mod menu;
 mod network;
@@ -6,13 +7,10 @@ mod player;
 mod screen;
 mod world;
 
-use bevy::{
-    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
-    prelude::*,
-    window::PresentMode,
-};
+use bevy::{prelude::*, window::PresentMode};
 
 use camera::CameraPlugin;
+use character::CharacterPlugin;
 use game_state::AppState;
 use menu::MenuPlugin;
 use network::NetworkPlugin;
@@ -32,10 +30,6 @@ fn main() {
                 ..default()
             }),
         )
-        .add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
-        ))
         .init_state::<AppState>()
         .add_plugins((
             MenuPlugin,
@@ -44,6 +38,7 @@ fn main() {
             PlayerPlugin,
             CameraPlugin,
             ScreenPlugin,
+            CharacterPlugin,
         ))
         .run();
 }

@@ -180,9 +180,10 @@ fn run_encoder_thread(
                 "Creating encoder for {}x{} (was {}x{})",
                 frame.width, frame.height, current_width, current_height
             );
-            // Configure encoder with higher bitrate for better quality (8 Mbps)
+            // Configure encoder for 60fps with good quality (10 Mbps)
             let config = EncoderConfig::new()
-                .set_bitrate_bps(8_000_000)
+                .set_bitrate_bps(10_000_000)
+                .max_frame_rate(60.0)
                 .enable_skip_frame(false);
             let api = OpenH264API::from_source();
             encoder = match Encoder::with_api_config(api, config) {

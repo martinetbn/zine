@@ -23,7 +23,7 @@ impl Default for ScreenStreamState {
         Self {
             frame_id: 0,
             last_stream_time: Instant::now() - Duration::from_secs(1),
-            stream_interval: Duration::from_millis(25), // ~40fps target
+            stream_interval: Duration::from_millis(16), // ~60fps target
         }
     }
 }

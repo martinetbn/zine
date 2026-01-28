@@ -298,7 +298,7 @@ impl Default for VideoJitterBuffer {
         Self {
             frames: VecDeque::with_capacity(8),
             target_size: 2,
-            min_delay: std::time::Duration::from_millis(30),
+            min_delay: std::time::Duration::from_millis(20), // ~1.2 frames at 60fps
             last_released_id: 0,
             frame_times: VecDeque::with_capacity(8),
         }

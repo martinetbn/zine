@@ -22,6 +22,9 @@ pub struct DecodedFrame {
     pub frame_id: u32,
 }
 
+/// Timeout for incomplete frame assembly (ms)
+const FRAME_ASSEMBLY_TIMEOUT_MS: u64 = 200;
+
 /// Resource for video frame assembly and decoding
 #[derive(Resource)]
 pub struct VideoDecoder {
@@ -37,6 +40,8 @@ pub struct VideoDecoder {
     total_chunks: u16,
     /// Chunks received count
     received_count: u16,
+    /// When we started assembling current frame
+    frame_start_time: Option<Instant>,
 }
 
 impl VideoDecoder {
@@ -56,6 +61,7 @@ impl VideoDecoder {
             chunks: Vec::new(),
             total_chunks: 0,
             received_count: 0,
+            frame_start_time: None,
         })
     }
 
@@ -70,12 +76,24 @@ impl VideoDecoder {
             || (chunk.frame_id == 0 && self.current_frame_id > 1000);
         let is_first = self.total_chunks == 0;
 
-        // Reset for new frame
-        if is_first || is_newer {
+        // Check if current frame assembly has timed out
+        let timed_out = self.frame_start_time
+            .map(|t| t.elapsed().as_millis() > FRAME_ASSEMBLY_TIMEOUT_MS as u128)
+            .unwrap_or(false);
+
+        // Reset for new frame or timeout
+        if is_first || is_newer || timed_out {
+            if timed_out && self.received_count > 0 {
+                warn!(
+                    "Frame {} timed out ({}/{} chunks), skipping to frame {}",
+                    self.current_frame_id, self.received_count, self.total_chunks, chunk.frame_id
+                );
+            }
             self.current_frame_id = chunk.frame_id;
             self.total_chunks = chunk.total_chunks;
             self.chunks = vec![None; chunk.total_chunks as usize];
             self.received_count = 0;
+            self.frame_start_time = Some(Instant::now());
         }
 
         // Ignore old frames
@@ -114,6 +132,7 @@ impl VideoDecoder {
                 self.chunks.clear();
                 self.received_count = 0;
                 self.total_chunks = 0;
+                self.frame_start_time = None;
             }
         }
     }
@@ -129,6 +148,15 @@ impl VideoDecoder {
         } else {
             None
         }
+    }
+
+    /// Reset frame assembly state (call when connection issues detected)
+    pub fn reset_assembly(&mut self) {
+        self.chunks.clear();
+        self.received_count = 0;
+        self.total_chunks = 0;
+        self.frame_start_time = None;
+        info!("Video decoder assembly state reset");
     }
 }
 
@@ -177,6 +205,9 @@ fn run_decoder_thread(data_rx: Receiver<(Vec<u8>, u32)>, decoded_tx: Sender<Deco
 
     info!("Video decoder started using OpenH264");
 
+    let mut consecutive_errors: u32 = 0;
+    let mut last_successful_decode = Instant::now();
+
     while let Ok((mut data, mut frame_id)) = data_rx.recv() {
         // Skip to latest data
         while let Ok((newer_data, newer_id)) = data_rx.try_recv() {
@@ -184,9 +215,26 @@ fn run_decoder_thread(data_rx: Receiver<(Vec<u8>, u32)>, decoded_tx: Sender<Deco
             frame_id = newer_id;
         }
 
+        // Reset decoder if too many consecutive errors or long time since success
+        if consecutive_errors > 30 || last_successful_decode.elapsed().as_secs() > 5 {
+            info!("Resetting decoder after {} errors or {}s without success",
+                consecutive_errors, last_successful_decode.elapsed().as_secs());
+            decoder = match Decoder::new() {
+                Ok(dec) => dec,
+                Err(e) => {
+                    error!("Failed to recreate decoder: {:?}", e);
+                    continue;
+                }
+            };
+            consecutive_errors = 0;
+        }
+
         // Decode the H.264 data
         match decoder.decode(&data) {
             Ok(Some(yuv)) => {
+                consecutive_errors = 0;
+                last_successful_decode = Instant::now();
+
                 let (width, height) = yuv.dimensions();
 
                 // Get YUV planes
@@ -214,9 +262,11 @@ fn run_decoder_thread(data_rx: Receiver<(Vec<u8>, u32)>, decoded_tx: Sender<Deco
                 });
             }
             Ok(None) => {
-                // No frame produced (might need more data)
+                // No frame produced (might need more data or waiting for keyframe)
+                consecutive_errors += 1;
             }
             Err(e) => {
+                consecutive_errors += 1;
                 // Only log occasionally to avoid spam
                 static LAST_ERROR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let now = std::time::SystemTime::now()

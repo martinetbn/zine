@@ -1,11 +1,12 @@
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::discovery::GAME_PORT;
 use super::protocol::{ClientMessage, LocalPlayerId, PlayerId, PlayerState, ServerMessage};
 use crate::game_state::AppState;
+use crate::menu::NotificationEvent;
 use crate::player::Player;
 use crate::screen::streaming::{LatestCapturedFrame, ScreenStreamState};
 
@@ -14,11 +15,15 @@ use crate::screen::audio_capture::AudioCapture;
 use crate::screen::audio_encoder::{AudioEncoder, AudioSender};
 use crate::screen::video_encoder::{VideoEncoder, VideoSender};
 
+/// Client timeout duration in seconds.
+const CLIENT_TIMEOUT_SECS: u64 = 5;
+
 /// Resource indicating this instance is the server/host.
 #[derive(Resource)]
 pub struct GameServer {
     pub socket: UdpSocket,
     pub clients: HashMap<SocketAddr, PlayerId>,
+    pub client_last_activity: HashMap<SocketAddr, Instant>,
     pub player_states: HashMap<PlayerId, PlayerState>,
     pub next_player_id: PlayerId,
 }
@@ -39,6 +44,7 @@ pub fn server_plugin(app: &mut App) {
         Update,
         (
             receive_client_messages,
+            check_client_timeouts,
             broadcast_game_state,
             update_host_player_state,
             broadcast_video_frames,
@@ -100,6 +106,7 @@ fn setup_server(mut commands: Commands) {
     commands.insert_resource(GameServer {
         socket,
         clients: HashMap::new(),
+        client_last_activity: HashMap::new(),
         player_states,
         next_player_id: 1,
     });
@@ -172,8 +179,12 @@ fn server_ready_check(
     }
 }
 
-fn receive_client_messages(mut server: ResMut<GameServer>) {
+fn receive_client_messages(
+    mut server: ResMut<GameServer>,
+    mut notifications: EventWriter<NotificationEvent>,
+) {
     let mut buf = [0u8; 1024];
+    let mut players_to_remove: Vec<SocketAddr> = Vec::new();
 
     loop {
         match server.socket.recv_from(&mut buf) {
@@ -186,6 +197,7 @@ fn receive_client_messages(mut server: ResMut<GameServer>) {
                                 let player_id = server.next_player_id;
                                 server.next_player_id += 1;
                                 server.clients.insert(src_addr, player_id);
+                                server.client_last_activity.insert(src_addr, Instant::now());
                                 server.player_states.insert(
                                     player_id,
                                     PlayerState {
@@ -196,6 +208,7 @@ fn receive_client_messages(mut server: ResMut<GameServer>) {
                                 );
 
                                 info!("Player {} joined from {}", player_id, src_addr);
+                                notifications.send(NotificationEvent("A user has joined".to_string()));
 
                                 // Send welcome message
                                 let welcome = ServerMessage::Welcome { your_id: player_id };
@@ -205,23 +218,83 @@ fn receive_client_messages(mut server: ResMut<GameServer>) {
                             }
                         }
                         ClientMessage::PlayerUpdate { position, yaw } => {
-                            // Update player state
+                            // Update player state and activity timestamp
                             if let Some(&player_id) = server.clients.get(&src_addr) {
+                                server.client_last_activity.insert(src_addr, Instant::now());
                                 if let Some(state) = server.player_states.get_mut(&player_id) {
                                     state.position = position;
                                     state.yaw = yaw;
                                 }
                             }
                         }
+                        ClientMessage::Leave => {
+                            // Client leaving gracefully
+                            if server.clients.contains_key(&src_addr) {
+                                players_to_remove.push(src_addr);
+                            }
+                        }
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // Client forcibly disconnected - this is expected on Windows
+                // The timeout system will clean up the client
+                continue;
+            }
             Err(e) => {
                 error!("Server receive error: {}", e);
                 break;
             }
         }
+    }
+
+    // Remove players who sent Leave messages
+    for addr in players_to_remove {
+        remove_client(&mut server, addr, &mut notifications);
+    }
+}
+
+/// Helper to remove a client and notify others.
+fn remove_client(
+    server: &mut GameServer,
+    addr: SocketAddr,
+    notifications: &mut EventWriter<NotificationEvent>,
+) {
+    if let Some(player_id) = server.clients.remove(&addr) {
+        server.client_last_activity.remove(&addr);
+        server.player_states.remove(&player_id);
+
+        info!("Player {} left", player_id);
+        notifications.send(NotificationEvent("A user has left".to_string()));
+
+        // Notify remaining clients
+        let msg = ServerMessage::PlayerLeft { id: player_id };
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            for &client_addr in server.clients.keys() {
+                let _ = server.socket.send_to(&data, client_addr);
+            }
+        }
+    }
+}
+
+/// Check for clients that haven't sent updates and remove them.
+fn check_client_timeouts(
+    mut server: ResMut<GameServer>,
+    mut notifications: EventWriter<NotificationEvent>,
+) {
+    let timeout = Duration::from_secs(CLIENT_TIMEOUT_SECS);
+    let now = Instant::now();
+
+    let timed_out: Vec<SocketAddr> = server
+        .client_last_activity
+        .iter()
+        .filter(|(_, last_activity)| now.duration_since(**last_activity) > timeout)
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    for addr in timed_out {
+        remove_client(&mut server, addr, &mut notifications);
     }
 }
 

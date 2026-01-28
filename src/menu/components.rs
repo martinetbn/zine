@@ -35,3 +35,11 @@ pub struct SessionEntry(pub usize);
 /// Marker for the "Searching..." text.
 #[derive(Component)]
 pub struct SearchingText;
+
+/// Marker for the notification container in the top-left.
+#[derive(Component)]
+pub struct NotificationRoot;
+
+/// Marker for a notification text element with remaining display time.
+#[derive(Component)]
+pub struct NotificationText(pub f32);

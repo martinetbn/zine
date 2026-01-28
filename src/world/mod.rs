@@ -5,7 +5,7 @@ pub mod setup;
 
 use bevy::prelude::*;
 
-pub use components::{Interactable, Screen, ScreenControlButton, ScreenFrame};
+pub use components::{Interactable, Screen, ScreenControlButton, ScreenFrame, WorldEntity};
 pub use interaction::ScreenControlEvent;
 
 use crate::game_state::AppState;
@@ -14,7 +14,7 @@ use interaction::{
     handle_screen_control_interaction, highlight_interactables, on_screen_control_event,
     update_looking_at, LookingAt,
 };
-use setup::setup_world;
+use setup::{cleanup_world, setup_world};
 
 // Room dimensions
 pub const ROOM_WIDTH: f32 = 10.0;
@@ -33,7 +33,7 @@ impl Plugin for WorldPlugin {
         app.init_resource::<LookingAt>()
             .add_event::<ScreenControlEvent>()
             .add_systems(OnEnter(AppState::InGame), (setup_world, setup_crosshair))
-            .add_systems(OnExit(AppState::InGame), cleanup_crosshair)
+            .add_systems(OnExit(AppState::InGame), (cleanup_world, cleanup_crosshair))
             .add_systems(
                 Update,
                 (

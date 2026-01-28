@@ -12,6 +12,8 @@ pub enum ClientMessage {
     PlayerUpdate { position: [f32; 3], yaw: f32 },
     /// Client requesting to join.
     Join,
+    /// Client leaving gracefully.
+    Leave,
 }
 
 /// Messages sent from server to clients.

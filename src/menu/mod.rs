@@ -1,16 +1,22 @@
 pub mod components;
+pub mod notification;
 pub mod styles;
 pub mod systems;
 
 use bevy::prelude::*;
 
 use crate::game_state::AppState;
+pub use notification::NotificationEvent;
+use notification::*;
 use systems::*;
 
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
     fn build(&self, app: &mut App) {
+        // Register notification event
+        app.add_event::<NotificationEvent>();
+
         app
             // Main menu
             .add_systems(OnEnter(AppState::MainMenu), (setup_main_menu, release_cursor))
@@ -34,6 +40,14 @@ impl Plugin for MenuPlugin {
                     .run_if(in_state(AppState::Browsing)),
             )
             // Cleanup menu camera when entering game
-            .add_systems(OnEnter(AppState::InGame), cleanup_menu_camera);
+            .add_systems(OnEnter(AppState::InGame), cleanup_menu_camera)
+            // Notification system (in-game only)
+            .add_systems(OnEnter(AppState::InGame), setup_notification_ui)
+            .add_systems(OnExit(AppState::InGame), cleanup_notification_ui)
+            .add_systems(
+                Update,
+                (display_notifications, update_notifications)
+                    .run_if(in_state(AppState::InGame)),
+            );
     }
 }

@@ -25,16 +25,49 @@ pub struct ClientSyncTimer(pub Timer);
 pub fn client_plugin(app: &mut App) {
     app.add_systems(OnEnter(AppState::Connecting), setup_client)
         .add_systems(OnExit(AppState::InGame), cleanup_client)
+        .add_systems(OnExit(AppState::Connecting), cleanup_on_connect_fail)
         .add_systems(
             Update,
-            (client_receive, client_connect_check).run_if(in_state(AppState::Connecting)),
+            (client_receive, client_connect_check, handle_host_disconnected)
+                .run_if(in_state(AppState::Connecting)),
         );
 
     app.add_systems(
         Update,
-        (client_receive, send_player_update, process_video_decoder)
+        (client_receive, send_player_update, process_video_decoder, handle_host_disconnected)
             .run_if(in_state(AppState::InGame).and(resource_exists::<GameClient>)),
     );
+}
+
+/// Handle host disconnection by returning to main menu.
+fn handle_host_disconnected(
+    mut commands: Commands,
+    mut next_state: ResMut<NextState<AppState>>,
+    disconnected: Option<Res<HostDisconnected>>,
+) {
+    if disconnected.is_some() {
+        commands.remove_resource::<HostDisconnected>();
+        next_state.set(AppState::MainMenu);
+    }
+}
+
+/// Cleanup client resources if connecting fails.
+fn cleanup_on_connect_fail(
+    mut commands: Commands,
+    client: Option<Res<GameClient>>,
+    local_id: Option<Res<LocalPlayerId>>,
+) {
+    // Only cleanup if we're transitioning back to menu (no local ID means connection failed)
+    if client.is_some() && local_id.is_none() {
+        commands.remove_resource::<GameClient>();
+        commands.remove_resource::<RemotePlayers>();
+        commands.remove_resource::<ClientSyncTimer>();
+        commands.remove_resource::<VideoDecoder>();
+        commands.remove_resource::<VideoJitterBuffer>();
+        commands.remove_resource::<AudioDecoder>();
+        commands.remove_resource::<HostDisconnected>();
+        commands.remove_resource::<SelectedSession>();
+    }
 }
 
 fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) {
@@ -110,7 +143,15 @@ fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) 
     info!("Connecting to server at {}", selected.0.address);
 }
 
-fn cleanup_client(mut commands: Commands) {
+fn cleanup_client(mut commands: Commands, client: Option<Res<GameClient>>) {
+    // Send leave message to server if we have a connection
+    if let Some(client) = client {
+        let leave_msg = ClientMessage::Leave;
+        if let Ok(data) = serde_json::to_vec(&leave_msg) {
+            let _ = client.socket.send(&data);
+        }
+    }
+
     commands.remove_resource::<GameClient>();
     commands.remove_resource::<SelectedSession>();
     commands.remove_resource::<LocalPlayerId>();
@@ -119,6 +160,7 @@ fn cleanup_client(mut commands: Commands) {
     commands.remove_resource::<VideoDecoder>();
     commands.remove_resource::<VideoJitterBuffer>();
     commands.remove_resource::<AudioDecoder>();
+    commands.remove_resource::<HostDisconnected>();
 }
 
 /// Event to update the screen texture with received frame data.
@@ -129,6 +171,10 @@ pub struct ReceivedScreenFrame {
     pub height: u32,
 }
 
+/// Resource to signal that the host has disconnected.
+#[derive(Resource)]
+pub struct HostDisconnected;
+
 fn client_receive(
     client: Option<Res<GameClient>>,
     mut commands: Commands,
@@ -136,7 +182,13 @@ fn client_receive(
     local_id: Option<Res<LocalPlayerId>>,
     mut video_decoder: Option<ResMut<VideoDecoder>>,
     audio_decoder: Option<Res<AudioDecoder>>,
+    disconnected: Option<Res<HostDisconnected>>,
 ) {
+    // Skip receiving if already marked as disconnected
+    if disconnected.is_some() {
+        return;
+    }
+
     let Some(client) = client else { return };
 
     // Large buffer to handle video frame chunks
@@ -190,8 +242,15 @@ fn client_receive(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                error!("Client receive error: {}", e);
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // Host disconnected - this is expected when host closes
+                info!("Host disconnected");
+                commands.insert_resource(HostDisconnected);
+                break;
+            }
+            Err(_) => {
+                // Other errors - treat as disconnection
+                commands.insert_resource(HostDisconnected);
                 break;
             }
         }

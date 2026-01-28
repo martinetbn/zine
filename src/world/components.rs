@@ -1,5 +1,9 @@
 use bevy::prelude::*;
 
+/// Marker for all world entities (room, lights, player, etc.) for cleanup.
+#[derive(Component)]
+pub struct WorldEntity;
+
 /// Marker for the cinema screen.
 #[derive(Component)]
 pub struct Screen;

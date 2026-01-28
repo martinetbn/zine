@@ -9,6 +9,7 @@ use super::protocol::{
 use crate::game_state::AppState;
 use crate::player::Player;
 
+use crate::screen::audio_decoder::AudioDecoder;
 use crate::screen::video_decoder::{VideoDecoder, VideoJitterBuffer};
 
 /// Resource indicating this instance is a client.
@@ -98,6 +99,14 @@ fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) 
         error!("Failed to initialize video decoder");
     }
 
+    // Initialize audio decoder and playback
+    if let Some(audio_decoder) = AudioDecoder::new() {
+        commands.insert_resource(audio_decoder);
+        info!("Audio decoder initialized (Opus)");
+    } else {
+        warn!("Failed to initialize audio decoder - audio playback disabled");
+    }
+
     info!("Connecting to server at {}", selected.0.address);
 }
 
@@ -109,6 +118,7 @@ fn cleanup_client(mut commands: Commands) {
     commands.remove_resource::<ClientSyncTimer>();
     commands.remove_resource::<VideoDecoder>();
     commands.remove_resource::<VideoJitterBuffer>();
+    commands.remove_resource::<AudioDecoder>();
 }
 
 /// Event to update the screen texture with received frame data.
@@ -125,6 +135,7 @@ fn client_receive(
     mut remote_players: Option<ResMut<RemotePlayers>>,
     local_id: Option<Res<LocalPlayerId>>,
     mut video_decoder: Option<ResMut<VideoDecoder>>,
+    audio_decoder: Option<Res<AudioDecoder>>,
 ) {
     let Some(client) = client else { return };
 
@@ -168,6 +179,11 @@ fn client_receive(
                         ServerMessage::VideoCodec(info) => {
                             if let Some(ref mut decoder) = video_decoder {
                                 decoder.set_codec_info(info);
+                            }
+                        }
+                        ServerMessage::AudioFrame(chunk) => {
+                            if let Some(ref decoder) = audio_decoder {
+                                decoder.add_chunk(chunk);
                             }
                         }
                     }

@@ -9,6 +9,9 @@ use crate::game_state::AppState;
 use crate::player::Player;
 use crate::screen::streaming::{LatestCapturedFrame, ScreenStreamState};
 
+use crate::network::protocol::AudioChunk;
+use crate::screen::audio_capture::AudioCapture;
+use crate::screen::audio_encoder::{AudioEncoder, AudioSender};
 use crate::screen::video_encoder::{VideoEncoder, VideoSender};
 
 /// Resource indicating this instance is the server/host.
@@ -39,6 +42,7 @@ pub fn server_plugin(app: &mut App) {
             broadcast_game_state,
             update_host_player_state,
             broadcast_video_frames,
+            broadcast_audio_frames,
         )
             .run_if(in_state(AppState::InGame).and(resource_exists::<GameServer>)),
     );
@@ -77,8 +81,9 @@ fn setup_server(mut commands: Commands) {
         }
     }
 
-    // Clone socket for video streaming before moving into GameServer
+    // Clone sockets for streaming before moving into GameServer
     let video_socket = socket.try_clone().ok();
+    let audio_socket = socket.try_clone().ok();
 
     // Host is player 0
     let host_id: PlayerId = 0;
@@ -120,6 +125,28 @@ fn setup_server(mut commands: Commands) {
         error!("Failed to initialize video encoder");
     }
 
+    // Initialize audio capture (system loopback)
+    if let Some(audio_capture) = AudioCapture::new() {
+        let sample_rate = audio_capture.sample_rate;
+        let channels = audio_capture.channels;
+        commands.insert_resource(audio_capture);
+
+        // Initialize Opus audio encoder
+        if let Some(audio_encoder) = AudioEncoder::new(sample_rate, channels) {
+            info!("Audio encoder initialized (Opus)");
+            commands.insert_resource(audio_encoder);
+
+            // Create audio sender with cloned socket
+            if let Some(as_socket) = audio_socket {
+                commands.insert_resource(AudioSender::new(as_socket));
+            }
+        } else {
+            error!("Failed to initialize audio encoder");
+        }
+    } else {
+        warn!("Failed to initialize audio capture - audio streaming disabled");
+    }
+
     info!("Server started on port {}", GAME_PORT);
 }
 
@@ -131,6 +158,9 @@ fn cleanup_server(mut commands: Commands) {
     commands.remove_resource::<LastStreamedFrame>();
     commands.remove_resource::<VideoEncoder>();
     commands.remove_resource::<VideoSender>();
+    commands.remove_resource::<AudioCapture>();
+    commands.remove_resource::<AudioEncoder>();
+    commands.remove_resource::<AudioSender>();
 }
 
 fn server_ready_check(
@@ -307,5 +337,81 @@ fn broadcast_video_frames(
         let submitted = SUBMITTED_FPS.swap(0, Ordering::Relaxed);
         let sent = SENT_FPS.swap(0, Ordering::Relaxed);
         info!("Server video FPS - submitted: {}, sent: {}", submitted, sent);
+    }
+}
+
+/// Broadcast audio frames to all connected clients.
+fn broadcast_audio_frames(
+    server: Res<GameServer>,
+    audio_capture: Option<Res<AudioCapture>>,
+    audio_encoder: Option<Res<AudioEncoder>>,
+    audio_sender: Option<Res<AudioSender>>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+    use std::sync::Mutex;
+
+    static CAPTURED_COUNT: AtomicU32 = AtomicU32::new(0);
+    static SENT_COUNT: AtomicU32 = AtomicU32::new(0);
+    static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let Some(capture) = audio_capture else {
+        return;
+    };
+
+    let Some(encoder) = audio_encoder else {
+        return;
+    };
+
+    let Some(sender) = audio_sender else {
+        return;
+    };
+
+    // Capture audio samples and submit for encoding
+    while let Some(samples) = capture.try_recv() {
+        CAPTURED_COUNT.fetch_add(1, Ordering::Relaxed);
+        encoder.submit_samples(samples, capture.sample_rate, capture.channels);
+    }
+
+    // Don't send if no clients
+    if server.clients.is_empty() {
+        return;
+    }
+
+    // Get encoded audio and send
+    while let Some(encoded) = encoder.get_encoded() {
+        let chunk = AudioChunk::new(
+            encoded.sequence,
+            encoded.sample_rate,
+            encoded.channels,
+            encoded.data,
+        );
+        let clients: Vec<SocketAddr> = server.clients.keys().cloned().collect();
+        sender.send(chunk, clients);
+        SENT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Log audio stats every second
+    let should_log = {
+        let mut last = LAST_LOG.lock().unwrap();
+        match *last {
+            None => {
+                *last = Some(Instant::now());
+                false
+            }
+            Some(t) if t.elapsed().as_secs() >= 1 => {
+                *last = Some(Instant::now());
+                true
+            }
+            _ => false,
+        }
+    };
+
+    if should_log {
+        let captured = CAPTURED_COUNT.swap(0, Ordering::Relaxed);
+        let sent = SENT_COUNT.swap(0, Ordering::Relaxed);
+        if captured > 0 || sent > 0 {
+            info!("Server audio - captured: {}/s, sent: {}/s", captured, sent);
+        }
     }
 }

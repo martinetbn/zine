@@ -1,3 +1,6 @@
+pub mod audio_capture;
+pub mod audio_decoder;
+pub mod audio_encoder;
 pub mod capture;
 pub mod share_ui;
 pub mod streaming;

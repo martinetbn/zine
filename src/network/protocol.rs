@@ -27,6 +27,8 @@ pub enum ServerMessage {
     VideoFrame(VideoChunk),
     /// Video codec information for client initialization.
     VideoCodec(VideoCodecInfo),
+    /// Opus audio chunk for streaming.
+    AudioFrame(AudioChunk),
 }
 
 /// H.264 video chunk for streaming.
@@ -74,6 +76,38 @@ pub struct VideoCodecInfo {
     pub fps: u32,
     /// Codec extradata (SPS/PPS for H.264).
     pub extradata: Vec<u8>,
+}
+
+/// Opus audio chunk for streaming.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AudioChunk {
+    /// Sequence number for ordering and loss detection.
+    pub sequence: u32,
+    /// Sample rate of the audio (e.g., 48000).
+    pub sample_rate: u32,
+    /// Number of channels (1 = mono, 2 = stereo).
+    pub channels: u8,
+    /// Opus-encoded audio data (base64 encoded).
+    data_b64: String,
+}
+
+impl AudioChunk {
+    pub fn new(sequence: u32, sample_rate: u32, channels: u8, data: Vec<u8>) -> Self {
+        Self {
+            sequence,
+            sample_rate,
+            channels,
+            data_b64: BASE64.encode(&data),
+        }
+    }
+
+    pub fn decode_data(&self) -> Option<Vec<u8>> {
+        BASE64.decode(&self.data_b64).ok()
+    }
+
+    pub fn data(&self) -> Vec<u8> {
+        self.decode_data().unwrap_or_default()
+    }
 }
 
 /// State of a single player, broadcast by the server.

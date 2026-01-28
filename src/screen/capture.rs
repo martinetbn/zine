@@ -3,15 +3,14 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Mutex;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::world::Screen;
 use crate::world::setup::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use super::streaming::LatestCapturedFrame;
-use super::window_capture::capture_window;
+use super::window_capture::{start_wgc_capture, WgcCapturedFrame};
 use super::ScreenDimensions;
 
 /// Type of capture source
@@ -43,24 +42,21 @@ pub struct ActiveDisplayCapture {
     pub capture_interval: Duration,
     pub frame_count: u32,
     pub would_block_count: u32,
+    pub fps_counter: u32,
+    pub fps_timer: Instant,
 }
 
-/// Captured frame data from background thread
-pub struct CapturedFrame {
-    pub rgba: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Resource for active window capture with background thread
+/// Resource for active window capture with background thread (using WGC)
 #[derive(Resource)]
 pub struct ActiveWindowCapture {
     pub hwnd: isize,
     pub width: u32,
     pub height: u32,
     pub frame_count: u32,
-    pub frame_receiver: Mutex<Receiver<CapturedFrame>>,
+    pub frame_receiver: Mutex<Receiver<WgcCapturedFrame>>,
     pub stop_sender: Mutex<Sender<()>>,
+    pub fps_counter: u32,
+    pub fps_timer: Instant,
 }
 
 /// Resource to signal that capture should start.
@@ -149,9 +145,11 @@ fn start_display_capture(world: &mut World, screen_index: usize) {
         width,
         height,
         last_capture: Instant::now() - Duration::from_millis(100),
-        capture_interval: Duration::from_millis(33),
+        capture_interval: Duration::from_millis(16), // ~60fps
         frame_count: 0,
         would_block_count: 0,
+        fps_counter: 0,
+        fps_timer: Instant::now(),
     });
 
     info!("Display capture started: {}x{}", width, height);
@@ -160,58 +158,27 @@ fn start_display_capture(world: &mut World, screen_index: usize) {
 fn start_window_capture_impl(world: &mut World, hwnd: isize) {
     info!("Starting window capture for hwnd {}", hwnd);
 
-    // Capture first frame to get dimensions
-    match capture_window(hwnd) {
-        Some((rgba, width, height)) => {
-            info!("Window capture initialized: {}x{}", width, height);
+    // Start WGC capture - it handles the background thread internally
+    match start_wgc_capture(hwnd) {
+        Some((frame_rx, stop_tx)) => {
+            info!("WGC window capture started for hwnd {}", hwnd);
 
-            create_capture_texture(world, width, height);
-            update_texture(world, rgba, width, height, true);
-
-            // Create channels for background capture
-            let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>();
-            let (stop_tx, stop_rx) = mpsc::channel::<()>();
-
-            // Spawn background capture thread
-            let capture_hwnd = hwnd;
-            thread::spawn(move || {
-                let interval = Duration::from_millis(33); // ~30fps
-                loop {
-                    // Check for stop signal
-                    if stop_rx.try_recv().is_ok() {
-                        break;
-                    }
-
-                    let start = Instant::now();
-
-                    // Capture window
-                    if let Some((rgba, width, height)) = capture_window(capture_hwnd) {
-                        let frame = CapturedFrame { rgba, width, height };
-                        if frame_tx.send(frame).is_err() {
-                            // Receiver dropped, exit thread
-                            break;
-                        }
-                    }
-
-                    // Sleep to maintain target framerate
-                    let elapsed = start.elapsed();
-                    if elapsed < interval {
-                        thread::sleep(interval - elapsed);
-                    }
-                }
-            });
+            // Create initial texture with placeholder dimensions (will be updated on first frame)
+            create_capture_texture(world, 1920, 1080);
 
             world.insert_resource(ActiveWindowCapture {
                 hwnd,
-                width,
-                height,
-                frame_count: 1,
+                width: 0,
+                height: 0,
+                frame_count: 0,
                 frame_receiver: Mutex::new(frame_rx),
                 stop_sender: Mutex::new(stop_tx),
+                fps_counter: 0,
+                fps_timer: Instant::now(),
             });
         }
         None => {
-            error!("Failed to capture window with hwnd {}", hwnd);
+            error!("Failed to start WGC capture for hwnd {}", hwnd);
         }
     }
 }
@@ -278,10 +245,8 @@ fn update_texture(world: &mut World, rgba: Vec<u8>, width: u32, height: u32, log
     let base_aspect = SCREEN_WIDTH / SCREEN_HEIGHT;
 
     let (new_width, new_height) = if video_aspect >= base_aspect {
-        // Video is wider than or equal to base - constrain by width
         (SCREEN_WIDTH, SCREEN_WIDTH / video_aspect)
     } else {
-        // Video is taller than base - constrain by height
         (SCREEN_HEIGHT * video_aspect, SCREEN_HEIGHT)
     };
 
@@ -379,24 +344,38 @@ pub fn process_display_capture(world: &mut World) {
             match capture.capturer.frame() {
                 Ok(frame) => {
                     let stride = frame.len() / height as usize;
-                    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+                    let pixel_count = (width * height) as usize;
+                    let mut rgba = vec![0u8; pixel_count * 4];
 
-                    // Read rows in reverse (DXGI is flipped)
-                    for y in (0..height as usize).rev() {
+                    // Read rows in reverse (DXGI is flipped) with optimized conversion
+                    for y in 0..height as usize {
+                        let src_y = height as usize - 1 - y;
+                        let src_row_start = src_y * stride;
+                        let dst_row_start = y * width as usize * 4;
+
                         for x in 0..width as usize {
-                            let i = y * stride + x * 4;
-                            if i + 3 < frame.len() {
-                                rgba.push(frame[i + 2]); // R
-                                rgba.push(frame[i + 1]); // G
-                                rgba.push(frame[i]);     // B
-                                rgba.push(255);          // A
-                            }
+                            let src_i = src_row_start + x * 4;
+                            let dst_i = dst_row_start + x * 4;
+                            // BGRA -> RGBA
+                            rgba[dst_i] = frame[src_i + 2];     // R
+                            rgba[dst_i + 1] = frame[src_i + 1]; // G
+                            rgba[dst_i + 2] = frame[src_i];     // B
+                            rgba[dst_i + 3] = 255;              // A
                         }
                     }
 
                     capture.frame_count += 1;
                     capture.would_block_count = 0;
                     capture.last_capture = Instant::now();
+                    capture.fps_counter += 1;
+
+                    // Log FPS every second
+                    if capture.fps_timer.elapsed() >= Duration::from_secs(1) {
+                        info!("Display capture FPS: {}", capture.fps_counter);
+                        capture.fps_counter = 0;
+                        capture.fps_timer = Instant::now();
+                    }
+
                     result = Some(rgba);
                     break;
                 }
@@ -451,6 +430,14 @@ pub fn process_window_capture(world: &mut World) {
             capture.frame_count += 1;
             capture.width = frame.width;
             capture.height = frame.height;
+            capture.fps_counter += 1;
+
+            // Log FPS every second
+            if capture.fps_timer.elapsed() >= Duration::from_secs(1) {
+                info!("Window capture FPS: {}", capture.fps_counter);
+                capture.fps_counter = 0;
+                capture.fps_timer = Instant::now();
+            }
         }
     }
 }

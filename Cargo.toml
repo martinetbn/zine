@@ -17,7 +17,7 @@ openh264 = "0.6"
 
 # Windows-specific dependencies for window capture
 [target.'cfg(windows)'.dependencies]
-win-screenshot = "4.0"
+windows-capture = "1.4"
 winapi = { version = "0.3", features = ["winuser", "dwmapi", "winsock2"] }
 
 # Enable optimizations for better runtime performance in dev

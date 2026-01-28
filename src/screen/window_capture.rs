@@ -1,4 +1,4 @@
-//! Window enumeration and capture for Windows platform
+//! Window enumeration and capture for Windows platform using Windows Graphics Capture API
 
 use bevy::prelude::*;
 
@@ -12,51 +12,31 @@ pub struct WindowInfo {
 /// Enumerate all visible windows that can be captured
 #[cfg(windows)]
 pub fn enumerate_windows() -> Vec<WindowInfo> {
-    use std::process::Command;
+    use windows_capture::window::Window;
 
-    // Use PowerShell to enumerate windows - completely isolates from Bevy's process
-    let script = r#"
-Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | ForEach-Object {
-    "$($_.MainWindowHandle)|$($_.MainWindowTitle)"
-}
-"#;
-
-    match Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-    {
-        Ok(output) => {
-            if !output.status.success() {
-                error!("PowerShell failed: {}", String::from_utf8_lossy(&output.stderr));
-                return Vec::new();
-            }
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut windows = Vec::new();
-
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    if let Ok(hwnd) = parts[0].parse::<isize>() {
-                        let title = parts[1].to_string();
-                        // Filter out system windows
-                        if !title.is_empty()
-                            && !title.starts_with("MSCTFIME")
-                            && !title.starts_with("Default IME")
-                            && title != "Program Manager"
-                            && title != "Settings"
-                        {
-                            windows.push(WindowInfo { title, hwnd });
-                        }
+    match Window::enumerate() {
+        Ok(windows) => {
+            let mut result = Vec::new();
+            for window in windows {
+                if let Ok(title) = window.title() {
+                    // Filter out system windows and empty titles
+                    if !title.is_empty()
+                        && !title.starts_with("MSCTFIME")
+                        && !title.starts_with("Default IME")
+                        && title != "Program Manager"
+                        && title != "Settings"
+                    {
+                        // Get HWND as isize
+                        let hwnd = window.as_raw_hwnd() as isize;
+                        result.push(WindowInfo { title, hwnd });
                     }
                 }
             }
-
-            info!("Found {} capturable windows via PowerShell", windows.len());
-            windows
+            info!("Found {} capturable windows", result.len());
+            result
         }
         Err(e) => {
-            error!("Failed to run PowerShell: {}", e);
+            error!("Failed to enumerate windows: {:?}", e);
             Vec::new()
         }
     }
@@ -67,88 +47,176 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
     Vec::new()
 }
 
-/// Capture a window by its HWND and return RGBA pixel data
-#[cfg(windows)]
-pub fn capture_window(hwnd: isize) -> Option<(Vec<u8>, u32, u32)> {
-    use std::panic::catch_unwind;
-
-    match catch_unwind(|| capture_window_impl(hwnd)) {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Window capture panicked: {:?}", e);
-            None
-        }
-    }
+/// Captured frame data from the capture thread
+pub struct WgcCapturedFrame {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
+/// Start continuous window capture using Windows Graphics Capture API.
+/// Returns a receiver for frames and a stop sender.
 #[cfg(windows)]
-fn capture_window_impl(hwnd: isize) -> Option<(Vec<u8>, u32, u32)> {
-    use win_screenshot::prelude::*;
+pub fn start_wgc_capture(
+    hwnd: isize,
+) -> Option<(
+    std::sync::mpsc::Receiver<WgcCapturedFrame>,
+    std::sync::mpsc::Sender<()>,
+)> {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use windows_capture::{
+        capture::{Context, GraphicsCaptureApiHandler},
+        frame::Frame,
+        graphics_capture_api::InternalCaptureControl,
+        settings::{
+            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+        },
+        window::Window,
+    };
 
-    // Try PrintWindow first
-    match capture_window_ex(hwnd, Using::PrintWindow, Area::Full, None, None) {
-        Ok(buf) => {
-            let width = buf.width;
-            let height = buf.height;
+    let (frame_tx, frame_rx) = mpsc::channel::<WgcCapturedFrame>();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+    // Find the window by HWND
+    let windows = match Window::enumerate() {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to enumerate windows: {:?}", e);
+            return None;
+        }
+    };
+
+    let target_window = windows
+        .into_iter()
+        .find(|w| w.as_raw_hwnd() as isize == hwnd);
+
+    let target_window = match target_window {
+        Some(w) => w,
+        None => {
+            error!("Window with HWND {} not found", hwnd);
+            return None;
+        }
+    };
+
+    let title = target_window.title().unwrap_or_default();
+    info!("Starting WGC capture for window: {} (hwnd: {})", title, hwnd);
+
+    // Capture handler that sends frames through channel
+    struct CaptureHandler {
+        frame_tx: mpsc::Sender<WgcCapturedFrame>,
+        stop_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl GraphicsCaptureApiHandler for CaptureHandler {
+        type Flags = (mpsc::Sender<WgcCapturedFrame>, Arc<Mutex<mpsc::Receiver<()>>>);
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+
+        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            let (frame_tx, stop_rx) = ctx.flags;
+            Ok(Self { frame_tx, stop_rx })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame,
+            capture_control: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            // Check for stop signal
+            if let Ok(rx) = self.stop_rx.lock() {
+                if rx.try_recv().is_ok() {
+                    capture_control.stop();
+                    return Ok(());
+                }
+            }
+
+            // Get frame buffer - WGC provides BGRA format
+            let width = frame.width();
+            let height = frame.height();
 
             if width == 0 || height == 0 {
-                warn!("Window has zero size");
-                return None;
+                return Ok(());
             }
 
-            let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-            for y in (0..height).rev() {
-                for x in 0..width {
-                    let i = ((y * width + x) * 4) as usize;
-                    if i + 3 < buf.pixels.len() {
-                        rgba.push(buf.pixels[i]);     // R (win-screenshot uses RGBA)
-                        rgba.push(buf.pixels[i + 1]); // G
-                        rgba.push(buf.pixels[i + 2]); // B
-                        rgba.push(buf.pixels[i + 3]); // A
+            // Get the raw buffer
+            let mut buffer = match frame.buffer() {
+                Ok(b) => b,
+                Err(_) => return Ok(()),
+            };
+
+            let raw_data = buffer.as_raw_buffer();
+            let pixel_count = (width * height) as usize;
+            let mut rgba = vec![0u8; pixel_count * 4];
+
+            // Convert BGRA to RGBA and flip vertically
+            // WGC provides top-down, but pipeline expects bottom-up
+            let stride = width as usize * 4;
+            for y in 0..height as usize {
+                let src_y = y;
+                let dst_y = height as usize - 1 - y;
+                let src_row = src_y * stride;
+                let dst_row = dst_y * stride;
+
+                for x in 0..width as usize {
+                    let src_i = src_row + x * 4;
+                    let dst_i = dst_row + x * 4;
+                    if src_i + 3 < raw_data.len() {
+                        rgba[dst_i] = raw_data[src_i + 2];     // R (from B)
+                        rgba[dst_i + 1] = raw_data[src_i + 1]; // G
+                        rgba[dst_i + 2] = raw_data[src_i];     // B (from R)
+                        rgba[dst_i + 3] = raw_data[src_i + 3]; // A
                     }
                 }
             }
 
-            Some((rgba, width, height))
+            // Send frame (non-blocking, drop if receiver is gone)
+            let _ = self.frame_tx.send(WgcCapturedFrame { rgba, width, height });
+
+            Ok(())
         }
-        Err(e) => {
-            warn!("PrintWindow failed: {:?}, trying BitBlt", e);
 
-            // Try BitBlt fallback
-            match capture_window_ex(hwnd, Using::BitBlt, Area::Full, None, None) {
-                Ok(buf) => {
-                    let width = buf.width;
-                    let height = buf.height;
-
-                    if width == 0 || height == 0 {
-                        return None;
-                    }
-
-                    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-                    for y in (0..height).rev() {
-                        for x in 0..width {
-                            let i = ((y * width + x) * 4) as usize;
-                            if i + 3 < buf.pixels.len() {
-                                rgba.push(buf.pixels[i]);     // R (win-screenshot uses RGBA)
-                                rgba.push(buf.pixels[i + 1]); // G
-                                rgba.push(buf.pixels[i + 2]); // B
-                                rgba.push(buf.pixels[i + 3]); // A
-                            }
-                        }
-                    }
-
-                    Some((rgba, width, height))
-                }
-                Err(e) => {
-                    error!("BitBlt also failed: {:?}", e);
-                    None
-                }
-            }
+        fn on_closed(&mut self) -> Result<(), Self::Error> {
+            info!("WGC capture closed");
+            Ok(())
         }
     }
+
+    let stop_rx_arc = Arc::new(Mutex::new(stop_rx));
+
+    // Start capture in background thread
+    thread::spawn(move || {
+        let settings = Settings::new(
+            target_window,
+            CursorCaptureSettings::Default,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            (frame_tx, stop_rx_arc),
+        );
+
+        if let Err(e) = CaptureHandler::start(settings) {
+            error!("WGC capture error: {:?}", e);
+        }
+    });
+
+    Some((frame_rx, stop_tx))
 }
 
-// Stub implementation for non-Windows platforms
+#[cfg(not(windows))]
+pub fn start_wgc_capture(
+    _hwnd: isize,
+) -> Option<(
+    std::sync::mpsc::Receiver<WgcCapturedFrame>,
+    std::sync::mpsc::Sender<()>,
+)> {
+    None
+}
+
+// Legacy function for compatibility - not used with WGC but kept for non-Windows
 #[cfg(not(windows))]
 pub fn capture_window(_hwnd: isize) -> Option<(Vec<u8>, u32, u32)> {
     None

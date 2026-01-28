@@ -223,29 +223,61 @@ fn process_video_decoder(
     mut jitter: Option<ResMut<VideoJitterBuffer>>,
     mut screen_frame_events: EventWriter<ReceivedScreenFrame>,
 ) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+    use std::sync::Mutex;
+
+    // FPS tracking for decoded frames
+    static DECODED_FPS_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static DISPLAYED_FPS_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static LAST_FPS_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+
     // Get decoded frames from decoder and add to jitter buffer
     if let Some(ref mut decoder) = decoder {
         while let Some(frame) = decoder.get_decoded() {
-            static RECEIVED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let count = RECEIVED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 30 == 0 {
-                info!("process_video_decoder: received frame {} ({}x{})", count, frame.width, frame.height);
-            }
+            DECODED_FPS_COUNTER.fetch_add(1, Ordering::Relaxed);
             if let Some(ref mut jitter) = jitter {
                 jitter.push(frame);
             }
         }
     }
 
-    // Pop frames from jitter buffer
+    // Pop frames from jitter buffer - drain any backlog and use the latest
     if let Some(ref mut jitter) = jitter {
-        if let Some(frame) = jitter.pop() {
+        let mut latest_frame = None;
+        while let Some(frame) = jitter.pop() {
+            latest_frame = Some(frame);
+        }
+        if let Some(frame) = latest_frame {
+            DISPLAYED_FPS_COUNTER.fetch_add(1, Ordering::Relaxed);
             screen_frame_events.send(ReceivedScreenFrame {
                 rgba: frame.rgba,
                 width: frame.width,
                 height: frame.height,
             });
         }
+    }
+
+    // Log FPS every second
+    let should_log = {
+        let mut last = LAST_FPS_LOG.lock().unwrap();
+        match *last {
+            None => {
+                *last = Some(Instant::now());
+                false
+            }
+            Some(t) if t.elapsed().as_secs() >= 1 => {
+                *last = Some(Instant::now());
+                true
+            }
+            _ => false,
+        }
+    };
+
+    if should_log {
+        let decoded = DECODED_FPS_COUNTER.swap(0, Ordering::Relaxed);
+        let displayed = DISPLAYED_FPS_COUNTER.swap(0, Ordering::Relaxed);
+        info!("Client video FPS - decoded: {}, displayed: {}", decoded, displayed);
     }
 }
 

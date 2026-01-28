@@ -243,6 +243,14 @@ fn broadcast_video_frames(
     encoder: Option<Res<VideoEncoder>>,
     sender: Option<Res<VideoSender>>,
 ) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+    use std::sync::Mutex;
+
+    static SUBMITTED_FPS: AtomicU32 = AtomicU32::new(0);
+    static SENT_FPS: AtomicU32 = AtomicU32::new(0);
+    static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+
     let Some(encoder) = encoder else {
         return;
     };
@@ -251,20 +259,19 @@ fn broadcast_video_frames(
         return;
     };
 
-    // Submit new frames for encoding
+    // Submit new frames for encoding - no interval gating, let encoder handle it
     if let Some(ref latest_frame) = latest_frame {
         let has_data = !latest_frame.rgba.is_empty();
         let is_new = latest_frame.frame_number != last_streamed.0;
-        let interval_ok = stream_state.last_stream_time.elapsed() >= stream_state.stream_interval;
 
-        if has_data && is_new && interval_ok {
+        if has_data && is_new {
             encoder.submit_frame(
                 latest_frame.rgba.clone(),
                 latest_frame.width,
                 latest_frame.height,
             );
             last_streamed.0 = latest_frame.frame_number;
-            stream_state.last_stream_time = std::time::Instant::now();
+            SUBMITTED_FPS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -275,10 +282,30 @@ fn broadcast_video_frames(
 
     if let Some(encoded) = encoder.get_encoded() {
         let clients: Vec<SocketAddr> = server.clients.keys().cloned().collect();
-        if stream_state.frame_id % 30 == 0 {
-            info!("Sending frame {} ({} chunks) to {} clients", stream_state.frame_id, encoded.chunks.len(), clients.len());
-        }
+        SENT_FPS.fetch_add(1, Ordering::Relaxed);
         sender.submit_chunks(encoded.chunks, clients);
         stream_state.frame_id = stream_state.frame_id.wrapping_add(1);
+    }
+
+    // Log FPS every second
+    let should_log = {
+        let mut last = LAST_LOG.lock().unwrap();
+        match *last {
+            None => {
+                *last = Some(Instant::now());
+                false
+            }
+            Some(t) if t.elapsed().as_secs() >= 1 => {
+                *last = Some(Instant::now());
+                true
+            }
+            _ => false,
+        }
+    };
+
+    if should_log {
+        let submitted = SUBMITTED_FPS.swap(0, Ordering::Relaxed);
+        let sent = SENT_FPS.swap(0, Ordering::Relaxed);
+        info!("Server video FPS - submitted: {}, sent: {}", submitted, sent);
     }
 }

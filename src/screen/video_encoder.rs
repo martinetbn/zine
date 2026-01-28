@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
 
 use crate::network::protocol::{ServerMessage, VideoChunk};
 
@@ -74,39 +73,47 @@ impl VideoEncoder {
     }
 }
 
-/// Convert RGBA to YUV420 frame for OpenH264
+/// Convert RGBA to YUV420 frame for OpenH264 (optimized)
 fn rgba_to_yuv_frame(rgba: &[u8], width: u32, height: u32) -> YuvFrame {
     let w = width as usize;
     let h = height as usize;
+    let w2 = w / 2;
+    let h2 = h / 2;
 
-    // YUV420: Y plane (w*h) + U plane (w/2 * h/2) + V plane (w/2 * h/2)
     let y_size = w * h;
-    let uv_size = (w / 2) * (h / 2);
+    let uv_size = w2 * h2;
 
     let mut y_plane = vec![0u8; y_size];
     let mut u_plane = vec![0u8; uv_size];
     let mut v_plane = vec![0u8; uv_size];
 
-    // Convert each pixel
+    // Process Y plane - all pixels
     for y in 0..h {
+        let row_offset = y * w;
+        let rgba_row = y * w * 4;
         for x in 0..w {
-            let rgba_idx = (y * w + x) * 4;
+            let rgba_idx = rgba_row + x * 4;
             let r = rgba[rgba_idx] as i32;
             let g = rgba[rgba_idx + 1] as i32;
             let b = rgba[rgba_idx + 2] as i32;
+            // BT.601 Y conversion
+            y_plane[row_offset + x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).min(255) as u8;
+        }
+    }
 
-            // RGB to YUV conversion (BT.601)
-            let y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[y * w + x] = y_val.clamp(0, 255) as u8;
-
-            // Subsample U and V (2x2 blocks)
-            if y % 2 == 0 && x % 2 == 0 {
-                let uv_idx = (y / 2) * (w / 2) + (x / 2);
-                let u_val = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v_val = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                u_plane[uv_idx] = u_val.clamp(0, 255) as u8;
-                v_plane[uv_idx] = v_val.clamp(0, 255) as u8;
-            }
+    // Process UV planes - 2x2 subsampled (use top-left pixel of each block)
+    for y in 0..h2 {
+        let uv_row = y * w2;
+        let rgba_row = (y * 2) * w * 4;
+        for x in 0..w2 {
+            let rgba_idx = rgba_row + (x * 2) * 4;
+            let r = rgba[rgba_idx] as i32;
+            let g = rgba[rgba_idx + 1] as i32;
+            let b = rgba[rgba_idx + 2] as i32;
+            let uv_idx = uv_row + x;
+            // BT.601 U/V conversion
+            u_plane[uv_idx] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            v_plane[uv_idx] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
         }
     }
 
@@ -180,11 +187,11 @@ fn run_encoder_thread(
                 "Creating encoder for {}x{} (was {}x{})",
                 frame.width, frame.height, current_width, current_height
             );
-            // Configure encoder for 60fps with good quality (10 Mbps)
+            // Configure encoder for 60fps with good quality (8 Mbps)
             let config = EncoderConfig::new()
-                .set_bitrate_bps(10_000_000)
+                .set_bitrate_bps(8_000_000)
                 .max_frame_rate(60.0)
-                .enable_skip_frame(false);
+                .enable_skip_frame(true);
             let api = OpenH264API::from_source();
             encoder = match Encoder::with_api_config(api, config) {
                 Ok(mut enc) => {
@@ -203,9 +210,9 @@ fn run_encoder_thread(
             };
         }
 
-        // Force keyframe every 60 frames for late-joining clients
+        // Force keyframe every 120 frames for late-joining clients (less frequent = faster)
         if let Some(ref mut enc) = encoder {
-            if frame_count > 0 && frame_count % 60 == 0 {
+            if frame_count > 0 && frame_count % 120 == 0 {
                 info!("Forcing keyframe at frame {}", frame_count);
                 enc.force_intra_frame();
             }
@@ -285,7 +292,7 @@ impl VideoSender {
                     clients = newer_clients;
                 }
 
-                for (i, chunk) in chunks.into_iter().enumerate() {
+                for chunk in chunks {
                     let msg = ServerMessage::VideoFrame(chunk);
                     if let Ok(data) = serde_json::to_vec(&msg) {
                         for client in &clients {
@@ -293,10 +300,6 @@ impl VideoSender {
                         }
                     }
 
-                    // Minimal pacing
-                    if i > 0 && i % 5 == 0 {
-                        thread::sleep(Duration::from_micros(100));
-                    }
                 }
             }
         });

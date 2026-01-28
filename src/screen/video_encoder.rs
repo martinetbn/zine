@@ -187,9 +187,13 @@ fn run_encoder_thread(
                 .enable_skip_frame(false);
             let api = OpenH264API::from_source();
             encoder = match Encoder::with_api_config(api, config) {
-                Ok(enc) => {
+                Ok(mut enc) => {
                     current_width = frame.width;
                     current_height = frame.height;
+                    // Force keyframe on first frame with new encoder so clients can decode immediately
+                    enc.force_intra_frame();
+                    // Reset frame count to ensure proper keyframe scheduling
+                    frame_count = 0;
                     Some(enc)
                 }
                 Err(e) => {

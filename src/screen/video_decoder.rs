@@ -72,9 +72,18 @@ impl VideoDecoder {
 
     /// Add a received video chunk
     pub fn add_chunk(&mut self, chunk: VideoChunk) {
-        let is_newer = chunk.frame_id > self.current_frame_id
-            || (chunk.frame_id == 0 && self.current_frame_id > 1000);
+        // Detect encoder reset: frame_id dropped significantly (source switch)
+        let is_encoder_reset = self.current_frame_id > 0
+            && chunk.frame_id < self.current_frame_id
+            && (self.current_frame_id - chunk.frame_id) > 10;
+
+        let is_newer = chunk.frame_id > self.current_frame_id || is_encoder_reset;
         let is_first = self.total_chunks == 0;
+
+        if is_encoder_reset {
+            info!("Encoder reset detected in chunk assembly (frame {} after {})",
+                chunk.frame_id, self.current_frame_id);
+        }
 
         // Check if current frame assembly has timed out
         let timed_out = self.frame_start_time
@@ -307,6 +316,22 @@ impl Default for VideoJitterBuffer {
 
 impl VideoJitterBuffer {
     pub fn push(&mut self, frame: DecodedFrame) {
+        // Detect encoder reset: new frame_id is much lower than last released
+        // This happens when switching capture sources (encoder restarts at frame 0)
+        let is_encoder_reset = self.last_released_id > 0
+            && frame.frame_id < self.last_released_id
+            && (self.last_released_id - frame.frame_id) > 10;
+
+        // Reset buffer on encoder restart
+        if is_encoder_reset {
+            info!("Encoder reset detected (frame {} after {}), clearing jitter buffer",
+                frame.frame_id, self.last_released_id);
+            self.frames.clear();
+            self.frame_times.clear();
+            self.last_released_id = 0;
+        }
+
+        // Reject old frames (but not after a reset)
         if frame.frame_id <= self.last_released_id && self.last_released_id > 0 {
             return;
         }

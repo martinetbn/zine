@@ -7,9 +7,7 @@ use super::discovery::GAME_PORT;
 use super::protocol::{ClientMessage, LocalPlayerId, PlayerId, PlayerState, ServerMessage};
 use crate::game_state::AppState;
 use crate::player::Player;
-use crate::screen::streaming::{
-    fragment_frame, BackgroundEncoder, BackgroundSender, LatestCapturedFrame, ScreenStreamState,
-};
+use crate::screen::streaming::{LatestCapturedFrame, ScreenStreamState};
 
 use crate::screen::video_encoder::{VideoEncoder, VideoSender};
 
@@ -41,7 +39,6 @@ pub fn server_plugin(app: &mut App) {
             broadcast_game_state,
             update_host_player_state,
             broadcast_video_frames,
-            broadcast_screen_frames, // Fallback for clients without hardware decoding
         )
             .run_if(in_state(AppState::InGame).and(resource_exists::<GameServer>)),
     );
@@ -80,8 +77,7 @@ fn setup_server(mut commands: Commands) {
         }
     }
 
-    // Clone sockets for background streaming before moving into GameServer
-    let stream_socket = socket.try_clone().ok();
+    // Clone socket for video streaming before moving into GameServer
     let video_socket = socket.try_clone().ok();
 
     // Host is player 0
@@ -103,11 +99,6 @@ fn setup_server(mut commands: Commands) {
         next_player_id: 1,
     });
 
-    // Create background sender with cloned socket (sends from same port as server)
-    if let Some(stream_socket) = stream_socket {
-        commands.insert_resource(BackgroundSender::new(stream_socket));
-    }
-
     commands.insert_resource(LocalPlayerId(host_id));
     commands.insert_resource(ServerSyncTimer(Timer::new(
         Duration::from_millis(50), // 20 updates per second
@@ -116,10 +107,9 @@ fn setup_server(mut commands: Commands) {
     commands.insert_resource(ScreenStreamState::default());
     commands.insert_resource(LastStreamedFrame::default());
 
-    // Initialize encoding - prefer hardware encoding if available
-    // Try to create hardware encoder (1920x1080 @ 30fps as default)
+    // Initialize H.264 video encoder (1920x1080 @ 30fps as default)
     if let Some(video_encoder) = VideoEncoder::new(1920, 1080, 30) {
-        info!("Using hardware video encoder");
+        info!("Video encoder initialized (OpenH264)");
         commands.insert_resource(video_encoder);
 
         // Create video sender with cloned socket
@@ -127,8 +117,7 @@ fn setup_server(mut commands: Commands) {
             commands.insert_resource(VideoSender::new(vs));
         }
     } else {
-        info!("Hardware encoding not available, using JPEG fallback");
-        commands.insert_resource(BackgroundEncoder::new());
+        error!("Failed to initialize video encoder");
     }
 
     info!("Server started on port {}", GAME_PORT);
@@ -140,8 +129,6 @@ fn cleanup_server(mut commands: Commands) {
     commands.remove_resource::<LocalPlayerId>();
     commands.remove_resource::<ScreenStreamState>();
     commands.remove_resource::<LastStreamedFrame>();
-    commands.remove_resource::<BackgroundEncoder>();
-    commands.remove_resource::<BackgroundSender>();
     commands.remove_resource::<VideoEncoder>();
     commands.remove_resource::<VideoSender>();
 }
@@ -247,78 +234,7 @@ fn broadcast_game_state(
 #[derive(Resource, Default)]
 pub struct LastStreamedFrame(pub u64);
 
-/// Debug counter for logging
-#[derive(Resource, Default)]
-pub struct StreamDebugCounter(pub u32);
-
-fn broadcast_screen_frames(
-    server: Res<GameServer>,
-    latest_frame: Option<Res<LatestCapturedFrame>>,
-    mut stream_state: ResMut<ScreenStreamState>,
-    mut last_streamed: ResMut<LastStreamedFrame>,
-    encoder: Option<Res<BackgroundEncoder>>,
-    sender: Option<Res<BackgroundSender>>,
-    mut debug_counter: Local<StreamDebugCounter>,
-) {
-    let Some(encoder) = encoder else {
-        debug_counter.0 += 1;
-        if debug_counter.0 % 100 == 1 {
-            warn!("No BackgroundEncoder resource!");
-        }
-        return;
-    };
-
-    let Some(sender) = sender else {
-        return;
-    };
-
-    // Submit new frames for encoding (non-blocking)
-    if let Some(ref latest_frame) = latest_frame {
-        let has_data = !latest_frame.rgba.is_empty();
-        let is_new = latest_frame.frame_number != last_streamed.0;
-        let interval_ok = stream_state.last_stream_time.elapsed() >= stream_state.stream_interval;
-
-        if has_data && is_new && interval_ok {
-            // Submit frame to background encoder (non-blocking)
-            encoder.submit_frame(
-                latest_frame.rgba.clone(),
-                latest_frame.width,
-                latest_frame.height,
-            );
-            last_streamed.0 = latest_frame.frame_number;
-            stream_state.last_stream_time = std::time::Instant::now();
-        }
-    } else {
-        debug_counter.0 += 1;
-        if debug_counter.0 % 100 == 1 {
-            warn!("No LatestCapturedFrame resource!");
-        }
-    }
-
-    // Check for encoded frames and send them (non-blocking)
-    if server.clients.is_empty() {
-        return;
-    }
-
-    if let Some(encoded) = encoder.get_encoded() {
-        // Fragment the frame
-        let fragments = fragment_frame(
-            encoded.jpeg_data,
-            stream_state.frame_id,
-            encoded.width,
-            encoded.height,
-        );
-
-        // Submit to background sender (non-blocking)
-        let clients: Vec<SocketAddr> = server.clients.keys().cloned().collect();
-        sender.submit_fragments(fragments, clients);
-
-        // Update frame id
-        stream_state.frame_id = stream_state.frame_id.wrapping_add(1);
-    }
-}
-
-/// Broadcast video frames using hardware encoding (H.264)
+/// Broadcast video frames using H.264 encoding
 fn broadcast_video_frames(
     server: Res<GameServer>,
     latest_frame: Option<Res<LatestCapturedFrame>>,
@@ -359,6 +275,9 @@ fn broadcast_video_frames(
 
     if let Some(encoded) = encoder.get_encoded() {
         let clients: Vec<SocketAddr> = server.clients.keys().cloned().collect();
+        if stream_state.frame_id % 30 == 0 {
+            info!("Sending frame {} ({} chunks) to {} clients", stream_state.frame_id, encoded.chunks.len(), clients.len());
+        }
         sender.submit_chunks(encoded.chunks, clients);
         stream_state.frame_id = stream_state.frame_id.wrapping_add(1);
     }

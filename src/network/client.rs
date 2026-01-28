@@ -8,7 +8,6 @@ use super::protocol::{
 };
 use crate::game_state::AppState;
 use crate::player::Player;
-use crate::screen::streaming::{decode_jpeg_to_rgba, FrameAssembler, JitterBuffer};
 
 use crate::screen::video_decoder::{VideoDecoder, VideoJitterBuffer};
 
@@ -32,7 +31,7 @@ pub fn client_plugin(app: &mut App) {
 
     app.add_systems(
         Update,
-        (client_receive, send_player_update, process_jitter_buffer, process_video_decoder)
+        (client_receive, send_player_update, process_video_decoder)
             .run_if(in_state(AppState::InGame).and(resource_exists::<GameClient>)),
     );
 }
@@ -90,12 +89,13 @@ fn setup_client(mut commands: Commands, selected: Option<Res<SelectedSession>>) 
         Duration::from_millis(50),
         TimerMode::Repeating,
     )));
-    commands.insert_resource(FrameAssembler::default());
-    commands.insert_resource(JitterBuffer::default());
 
     if let Some(decoder) = VideoDecoder::new() {
         commands.insert_resource(decoder);
         commands.insert_resource(VideoJitterBuffer::default());
+        info!("Video decoder initialized (OpenH264)");
+    } else {
+        error!("Failed to initialize video decoder");
     }
 
     info!("Connecting to server at {}", selected.0.address);
@@ -107,8 +107,6 @@ fn cleanup_client(mut commands: Commands) {
     commands.remove_resource::<LocalPlayerId>();
     commands.remove_resource::<RemotePlayers>();
     commands.remove_resource::<ClientSyncTimer>();
-    commands.remove_resource::<FrameAssembler>();
-    commands.remove_resource::<JitterBuffer>();
     commands.remove_resource::<VideoDecoder>();
     commands.remove_resource::<VideoJitterBuffer>();
 }
@@ -126,13 +124,11 @@ fn client_receive(
     mut commands: Commands,
     mut remote_players: Option<ResMut<RemotePlayers>>,
     local_id: Option<Res<LocalPlayerId>>,
-    mut frame_assembler: Option<ResMut<FrameAssembler>>,
-    mut jitter_buffer: Option<ResMut<JitterBuffer>>,
     mut video_decoder: Option<ResMut<VideoDecoder>>,
 ) {
     let Some(client) = client else { return };
 
-    // Large buffer to handle screen frame fragments
+    // Large buffer to handle video frame chunks
     let mut buf = [0u8; 32768];
 
     loop {
@@ -159,18 +155,12 @@ fn client_receive(
                                 remote.players.retain(|p| p.id != id);
                             }
                         }
-                        ServerMessage::ScreenFrame(fragment) => {
-                            if let Some(ref mut assembler) = frame_assembler {
-                                if let Some((jpeg_data, width, height, frame_id)) =
-                                    assembler.add_fragment(fragment)
-                                {
-                                    if let Some(ref mut jitter) = jitter_buffer {
-                                        jitter.push_frame(jpeg_data, width, height, frame_id);
-                                    }
-                                }
-                            }
-                        }
                         ServerMessage::VideoFrame(chunk) => {
+                            static CHUNK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            let count = CHUNK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if count % 100 == 0 {
+                                info!("Received video chunk {} (frame {}, chunk {}/{})", count, chunk.frame_id, chunk.chunk_idx, chunk.total_chunks);
+                            }
                             if let Some(ref mut decoder) = video_decoder {
                                 decoder.add_chunk(chunk);
                             }
@@ -227,29 +217,7 @@ fn send_player_update(
     }
 }
 
-/// Process the jitter buffer and send frames to be displayed
-fn process_jitter_buffer(
-    mut jitter_buffer: Option<ResMut<JitterBuffer>>,
-    mut screen_frame_events: EventWriter<ReceivedScreenFrame>,
-) {
-    let Some(ref mut jitter) = jitter_buffer else {
-        return;
-    };
-
-    // Pop frame from jitter buffer when ready
-    if let Some((jpeg_data, _width, _height)) = jitter.pop_frame() {
-        // Decode JPEG and send event
-        if let Some((rgba, w, h)) = decode_jpeg_to_rgba(&jpeg_data) {
-            screen_frame_events.send(ReceivedScreenFrame {
-                rgba,
-                width: w,
-                height: h,
-            });
-        }
-    }
-}
-
-/// Process hardware-decoded video frames
+/// Process decoded video frames
 fn process_video_decoder(
     mut decoder: Option<ResMut<VideoDecoder>>,
     mut jitter: Option<ResMut<VideoJitterBuffer>>,
@@ -258,6 +226,11 @@ fn process_video_decoder(
     // Get decoded frames from decoder and add to jitter buffer
     if let Some(ref mut decoder) = decoder {
         while let Some(frame) = decoder.get_decoded() {
+            static RECEIVED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = RECEIVED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 30 == 0 {
+                info!("process_video_decoder: received frame {} ({}x{})", count, frame.width, frame.height);
+            }
             if let Some(ref mut jitter) = jitter {
                 jitter.push(frame);
             }

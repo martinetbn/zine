@@ -1,9 +1,12 @@
-//! H.264 video decoder using FFmpeg CLI.
+//! H.264 video decoder using OpenH264.
+//!
+//! Uses Cisco's OpenH264 library for software H.264 decoding.
+//! No external dependencies required - the library is downloaded automatically at build time.
 
 use bevy::prelude::*;
+use openh264::decoder::Decoder;
+use openh264::formats::YUVSource;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread;
@@ -26,8 +29,6 @@ pub struct VideoDecoder {
     send_data: Mutex<Sender<(Vec<u8>, u32)>>,
     /// Receive decoded RGBA frames
     recv_decoded: Mutex<Receiver<DecodedFrame>>,
-    /// Codec info from server
-    codec_info: Option<VideoCodecInfo>,
     /// Current frame being assembled
     current_frame_id: u32,
     /// Chunks for current frame
@@ -36,25 +37,10 @@ pub struct VideoDecoder {
     total_chunks: u16,
     /// Chunks received count
     received_count: u16,
-    /// Decoder dimensions (set from first frame)
-    width: u32,
-    height: u32,
 }
 
 impl VideoDecoder {
     pub fn new() -> Option<Self> {
-        // Check if FFmpeg is available
-        if std::process::Command::new("ffmpeg")
-            .args(["-version"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            warn!("FFmpeg not found in PATH, video decoding disabled");
-            return None;
-        }
-
         let (data_tx, data_rx) = mpsc::channel::<(Vec<u8>, u32)>();
         let (decoded_tx, decoded_rx) = mpsc::channel::<DecodedFrame>();
 
@@ -66,21 +52,16 @@ impl VideoDecoder {
         Some(Self {
             send_data: Mutex::new(data_tx),
             recv_decoded: Mutex::new(decoded_rx),
-            codec_info: None,
             current_frame_id: 0,
             chunks: Vec::new(),
             total_chunks: 0,
             received_count: 0,
-            width: 1920,
-            height: 1080,
         })
     }
 
-    /// Set codec information from server
-    pub fn set_codec_info(&mut self, info: VideoCodecInfo) {
-        self.width = info.width;
-        self.height = info.height;
-        self.codec_info = Some(info);
+    /// Set codec information from server (not needed for OpenH264 but kept for API compatibility)
+    pub fn set_codec_info(&mut self, _info: VideoCodecInfo) {
+        // OpenH264 decoder auto-detects dimensions from the stream
     }
 
     /// Add a received video chunk
@@ -118,6 +99,12 @@ impl VideoDecoder {
                     }
                 }
 
+                static ASSEMBLED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let count = ASSEMBLED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count % 30 == 0 {
+                    info!("Assembled complete frame {} ({} bytes)", count, data.len());
+                }
+
                 // Send for decoding
                 if let Ok(sender) = self.send_data.lock() {
                     let _ = sender.send((data, self.current_frame_id));
@@ -145,76 +132,50 @@ impl VideoDecoder {
     }
 }
 
-impl Default for VideoDecoder {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize video decoder")
+/// Convert YUV420 planar to RGBA
+fn yuv420_to_rgba(y_plane: &[u8], u_plane: &[u8], v_plane: &[u8], width: usize, height: usize, y_stride: usize, uv_stride: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; width * height * 4];
+
+    for row in 0..height {
+        for col in 0..width {
+            let y_idx = row * y_stride + col;
+            let uv_idx = (row / 2) * uv_stride + (col / 2);
+
+            let y = y_plane[y_idx] as i32;
+            let u = u_plane[uv_idx] as i32;
+            let v = v_plane[uv_idx] as i32;
+
+            // YUV to RGB conversion (BT.601)
+            let c = y - 16;
+            let d = u - 128;
+            let e = v - 128;
+
+            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+
+            let rgba_idx = (row * width + col) * 4;
+            rgba[rgba_idx] = r;
+            rgba[rgba_idx + 1] = g;
+            rgba[rgba_idx + 2] = b;
+            rgba[rgba_idx + 3] = 255;
+        }
     }
+
+    rgba
 }
 
-/// Run the decoder thread using FFmpeg subprocess
+/// Run the decoder thread using OpenH264
 fn run_decoder_thread(data_rx: Receiver<(Vec<u8>, u32)>, decoded_tx: Sender<DecodedFrame>) {
-    // We'll spawn FFmpeg on first data received to know dimensions
-    // Default to 1920x1080, can be adjusted
-    let width = 1920u32;
-    let height = 1080u32;
-
-    // Spawn FFmpeg decoder process
-    // Input: H.264 Annex B from stdin
-    // Output: Raw RGBA to stdout
-    let size_str = format!("{}x{}", width, height);
-
-    let mut ffmpeg = match std::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            // Input format
-            "-f",
-            "h264",
-            "-i",
-            "pipe:0",
-            // Output format
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "-s",
-            &size_str,
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
+    let mut decoder = match Decoder::new() {
+        Ok(dec) => dec,
         Err(e) => {
-            error!("Failed to spawn FFmpeg decoder: {}", e);
+            error!("Failed to create OpenH264 decoder: {:?}", e);
             return;
         }
     };
 
-    let mut stdin = ffmpeg.stdin.take().expect("Failed to get stdin");
-    let mut stdout = ffmpeg.stdout.take().expect("Failed to get stdout");
-
-    // Frame size in bytes (RGBA)
-    let frame_size = (width * height * 4) as usize;
-
-    // Spawn thread to read decoded output
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut buf = vec![0u8; frame_size];
-        loop {
-            match stdout.read_exact(&mut buf) {
-                Ok(()) => {
-                    let _ = output_tx.send(buf.clone());
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    info!("Video decoder started: {}x{}", width, height);
+    info!("Video decoder started using OpenH264");
 
     while let Ok((mut data, mut frame_id)) = data_rx.recv() {
         // Skip to latest data
@@ -223,25 +184,53 @@ fn run_decoder_thread(data_rx: Receiver<(Vec<u8>, u32)>, decoded_tx: Sender<Deco
             frame_id = newer_id;
         }
 
-        // Write H.264 data to FFmpeg stdin
-        if stdin.write_all(&data).is_err() {
-            error!("Failed to write to FFmpeg decoder");
-            break;
-        }
+        // Decode the H.264 data
+        match decoder.decode(&data) {
+            Ok(Some(yuv)) => {
+                let (width, height) = yuv.dimensions();
 
-        // Collect decoded frames
-        while let Ok(rgba) = output_rx.try_recv() {
-            let _ = decoded_tx.send(DecodedFrame {
-                rgba,
-                width,
-                height,
-                frame_id,
-            });
+                // Get YUV planes
+                let y_plane = yuv.y();
+                let u_plane = yuv.u();
+                let v_plane = yuv.v();
+
+                // Get strides (y_stride, u_stride, v_stride)
+                let (y_stride, u_stride, _v_stride) = yuv.strides();
+
+                // Convert to RGBA
+                let rgba = yuv420_to_rgba(y_plane, u_plane, v_plane, width, height, y_stride, u_stride);
+
+                static DECODED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let count = DECODED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count % 30 == 0 {
+                    info!("Decoded frame {} ({}x{})", count, width, height);
+                }
+
+                let _ = decoded_tx.send(DecodedFrame {
+                    rgba,
+                    width: width as u32,
+                    height: height as u32,
+                    frame_id,
+                });
+            }
+            Ok(None) => {
+                // No frame produced (might need more data)
+            }
+            Err(e) => {
+                // Only log occasionally to avoid spam
+                static LAST_ERROR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last = LAST_ERROR.load(std::sync::atomic::Ordering::Relaxed);
+                if now > last + 5 {
+                    LAST_ERROR.store(now, std::sync::atomic::Ordering::Relaxed);
+                    warn!("Decode error (may need keyframe): {:?}", e);
+                }
+            }
         }
     }
-
-    drop(stdin);
-    let _ = ffmpeg.wait();
 }
 
 /// Jitter buffer for video frames

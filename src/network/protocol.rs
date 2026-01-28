@@ -9,7 +9,7 @@ pub type PlayerId = u64;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientMessage {
     /// Client sending their current position and rotation.
-    PlayerUpdate { position: [f32; 3], yaw: f32 },
+    PlayerUpdate { position: [f32; 3], yaw: f32, pitch: f32 },
     /// Client requesting to join.
     Join,
     /// Client leaving gracefully.
@@ -118,6 +118,7 @@ pub struct PlayerState {
     pub id: PlayerId,
     pub position: [f32; 3],
     pub yaw: f32,
+    pub pitch: f32,
 }
 
 /// Resource storing the local player's network ID.
@@ -135,6 +136,7 @@ pub struct RemotePlayer {
 pub struct NetworkTransform {
     pub target_position: Vec3,
     pub target_yaw: f32,
+    pub target_pitch: f32,
 }
 
 /// Resource tracking all known remote players for the client.

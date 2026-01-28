@@ -100,6 +100,7 @@ fn setup_server(mut commands: Commands) {
             id: host_id,
             position: [0.0, 1.8, 4.0],
             yaw: std::f32::consts::PI,
+            pitch: 0.0,
         },
     );
 
@@ -204,6 +205,7 @@ fn receive_client_messages(
                                         id: player_id,
                                         position: [0.0, 1.8, 4.0],
                                         yaw: std::f32::consts::PI,
+                                        pitch: 0.0,
                                     },
                                 );
 
@@ -217,13 +219,14 @@ fn receive_client_messages(
                                 }
                             }
                         }
-                        ClientMessage::PlayerUpdate { position, yaw } => {
+                        ClientMessage::PlayerUpdate { position, yaw, pitch } => {
                             // Update player state and activity timestamp
                             if let Some(&player_id) = server.clients.get(&src_addr) {
                                 server.client_last_activity.insert(src_addr, Instant::now());
                                 if let Some(state) = server.player_states.get_mut(&player_id) {
                                     state.position = position;
                                     state.yaw = yaw;
+                                    state.pitch = pitch;
                                 }
                             }
                         }
@@ -300,15 +303,16 @@ fn check_client_timeouts(
 
 fn update_host_player_state(
     mut server: ResMut<GameServer>,
-    player_query: Query<&Transform, With<Player>>,
+    player_query: Query<(&Transform, &crate::player::CameraController), With<Player>>,
     local_id: Res<LocalPlayerId>,
 ) {
-    if let Ok(transform) = player_query.get_single() {
+    if let Ok((transform, camera_controller)) = player_query.get_single() {
         if let Some(state) = server.player_states.get_mut(&local_id.0) {
             state.position = transform.translation.into();
             // Extract yaw from rotation
             let (yaw, _, _) = transform.rotation.to_euler(EulerRot::YXZ);
             state.yaw = yaw;
+            state.pitch = camera_controller.pitch;
         }
     }
 }

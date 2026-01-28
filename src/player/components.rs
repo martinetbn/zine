@@ -28,7 +28,7 @@ impl Default for CameraController {
 pub const PLAYER_SPEED: f32 = 5.0;
 pub const JUMP_VELOCITY: f32 = 8.0;
 pub const GRAVITY: f32 = 20.0;
-pub const PLAYER_HEIGHT: f32 = 1.8;
+pub const PLAYER_HEIGHT: f32 = 2.0;
 pub const GROUND_LEVEL: f32 = 0.0;
 
 // Mouse look constants

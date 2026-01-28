@@ -273,18 +273,19 @@ fn send_player_update(
     time: Res<Time>,
     mut timer: ResMut<ClientSyncTimer>,
     client: Res<GameClient>,
-    player_query: Query<&Transform, With<Player>>,
+    player_query: Query<(&Transform, &crate::player::CameraController), With<Player>>,
 ) {
     timer.0.tick(time.delta());
     if !timer.0.just_finished() {
         return;
     }
 
-    if let Ok(transform) = player_query.get_single() {
+    if let Ok((transform, camera_controller)) = player_query.get_single() {
         let (yaw, _, _) = transform.rotation.to_euler(EulerRot::YXZ);
         let msg = ClientMessage::PlayerUpdate {
             position: transform.translation.into(),
             yaw,
+            pitch: camera_controller.pitch,
         };
 
         if let Ok(data) = serde_json::to_vec(&msg) {
@@ -375,7 +376,7 @@ pub fn update_remote_player_visuals(
     }
 
     // Player height constant (eye level above feet)
-    const PLAYER_HEIGHT: f32 = 1.8;
+    const PLAYER_HEIGHT: f32 = 2.0;
     // Model pivot offset (adjust if character floats or clips)
     const MODEL_OFFSET: f32 = -0.15;
 
@@ -406,6 +407,7 @@ pub fn update_remote_player_visuals(
             // Update target for existing remote player
             net_transform.target_position = target_pos;
             net_transform.target_yaw = corrected_yaw;
+            net_transform.target_pitch = player_state.pitch;
         } else {
             // Spawn new remote player with character model
             info!("Spawning remote player {}", player_state.id);
@@ -417,6 +419,7 @@ pub fn update_remote_player_visuals(
                     NetworkTransform {
                         target_position: target_pos,
                         target_yaw: corrected_yaw,
+                        target_pitch: player_state.pitch,
                     },
                     CharacterAnimationState::default(),
                     Transform::from_translation(target_pos)
@@ -433,6 +436,7 @@ pub fn update_remote_player_visuals(
                     NetworkTransform {
                         target_position: target_pos,
                         target_yaw: corrected_yaw,
+                        target_pitch: player_state.pitch,
                     },
                     CharacterAnimationState::default(),
                     Transform::from_translation(target_pos)

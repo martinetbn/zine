@@ -1,4 +1,4 @@
-use bevy::{animation::prelude::AnimationTransitions, gltf::Gltf, prelude::*};
+use bevy::{animation::prelude::AnimationTransitions, app::Animation, gltf::Gltf, prelude::*, transform::TransformSystem};
 
 use crate::game_state::AppState;
 use crate::network::protocol::RemotePlayer;
@@ -49,6 +49,10 @@ pub struct AnimationInitialized;
 #[derive(Component)]
 pub struct CharacterAnimationLink(pub Entity);
 
+/// Links a character root entity to its head bone entity for head tracking.
+#[derive(Component)]
+pub struct CharacterHeadLink(pub Entity);
+
 pub struct CharacterPlugin;
 
 /// How long walking state persists after movement stops (in seconds).
@@ -65,9 +69,18 @@ impl Plugin for CharacterPlugin {
                     attach_model_to_players_without_model,
                     decay_walking_state,
                     setup_character_animation_graph,
+                    setup_head_bone_link,
                     start_character_animations,
                 )
                     .chain()
+                    .run_if(in_state(AppState::InGame)),
+            )
+            // Run head rotation after animation systems
+            .add_systems(
+                PostUpdate,
+                update_head_rotation
+                    .after(Animation)
+                    .before(TransformSystem::TransformPropagate)
                     .run_if(in_state(AppState::InGame)),
             );
     }
@@ -271,11 +284,6 @@ fn start_character_animations(
 
             // Switch animation when state changes
             if state_changed {
-                info!(
-                    "Animation state change: walking={} -> playing {:?}",
-                    anim_state.is_walking,
-                    if anim_state.is_walking { "walk" } else { "static" }
-                );
                 anim_state.last_was_walking = Some(anim_state.is_walking);
                 // Use transitions for smooth blending (150ms crossfade)
                 transitions
@@ -309,4 +317,90 @@ fn find_entity_with_component<T: Component>(
     }
 
     None
+}
+
+/// Recursively finds an entity with the specified name in the hierarchy.
+fn find_entity_by_name(
+    entity: Entity,
+    name: &str,
+    children_query: &Query<&Children>,
+    name_query: &Query<&Name>,
+) -> Option<Entity> {
+    // Check if this entity has the matching name
+    if let Ok(entity_name) = name_query.get(entity) {
+        if entity_name.as_str() == name {
+            return Some(entity);
+        }
+    }
+
+    // Check children recursively
+    if let Ok(children) = children_query.get(entity) {
+        for &child in children.iter() {
+            if let Some(result) = find_entity_by_name(child, name, children_query, name_query) {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+/// Find and link the head bone for characters that have been initialized.
+fn setup_head_bone_link(
+    mut commands: Commands,
+    query: Query<Entity, (With<AnimationInitialized>, Without<CharacterHeadLink>)>,
+    children_query: Query<&Children>,
+    name_query: Query<&Name>,
+) {
+    for root_entity in query.iter() {
+        // Try common head bone names
+        let head_names = ["Head", "head", "mixamorig:Head", "Bone.Head"];
+
+        for head_name in head_names {
+            if let Some(head_entity) =
+                find_entity_by_name(root_entity, head_name, &children_query, &name_query)
+            {
+                info!("Found head bone '{}' for character {:?}", head_name, root_entity);
+                commands
+                    .entity(root_entity)
+                    .insert(CharacterHeadLink(head_entity));
+                break;
+            }
+        }
+    }
+}
+
+/// Stores the interpolated pitch for smooth head movement.
+#[derive(Component, Default)]
+pub struct HeadPitch {
+    pub current: f32,
+}
+
+/// Update head rotation based on pitch from NetworkTransform.
+/// This runs after transform propagation.
+fn update_head_rotation(
+    mut commands: Commands,
+    character_query: Query<(Entity, &CharacterHeadLink, &crate::network::protocol::NetworkTransform), Without<HeadPitch>>,
+    mut head_query: Query<(Entity, &CharacterHeadLink, &crate::network::protocol::NetworkTransform, &mut HeadPitch)>,
+    mut transform_query: Query<&mut Transform>,
+    time: Res<Time>,
+) {
+    // Add HeadPitch component to new characters
+    for (entity, _, _) in character_query.iter() {
+        commands.entity(entity).insert(HeadPitch::default());
+    }
+
+    // Update head rotation for characters with HeadPitch
+    for (_entity, head_link, net_transform, mut head_pitch) in head_query.iter_mut() {
+        // Smoothly interpolate pitch
+        let target_pitch = net_transform.target_pitch;
+        head_pitch.current = head_pitch.current + (target_pitch - head_pitch.current) * time.delta_secs() * 10.0;
+
+        if let Ok(mut head_transform) = transform_query.get_mut(head_link.0) {
+            // Get the current rotation from animation and apply pitch on top
+            let current_rot = head_transform.rotation;
+            let pitch_rotation = Quat::from_rotation_x(-head_pitch.current);
+            head_transform.rotation = current_rot * pitch_rotation;
+        }
+    }
 }
